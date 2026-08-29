@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
-import { isArkConfigured } from "./config.js";
+import { isModelConfigured, isOpenRouterConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type {
@@ -154,10 +154,10 @@ export class AgentService {
     agentId: string,
     prompt: string,
   ): Promise<{ run: AgentRun; message: Message }> {
-    if (!isArkConfigured(this.config)) {
+    if (!isModelConfigured(this.config)) {
       throw new HttpError(
         503,
-        "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
+        "No model provider is configured. Set OPENROUTER_API_KEY and OPENROUTER_MODEL or ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
     const timestamp = now();
@@ -215,7 +215,10 @@ export class AgentService {
 
   async systemInfo(): Promise<Record<string, unknown>> {
     return {
-      arkConfigured: isArkConfigured(this.config),
+      openRouterConfigured: isOpenRouterConfigured(this.config),
+      openRouterBaseUrl: this.config.openRouterBaseUrl,
+      openRouterModel: this.config.openRouterModel || null,
+      arkConfigured: isModelConfigured(this.config) && !isOpenRouterConfigured(this.config),
       arkBaseUrl: this.config.arkBaseUrl,
       arkModel: this.config.arkModel || null,
       codexAvailable: await this.runner.isAvailable(),

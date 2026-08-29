@@ -1,9 +1,9 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentService } from "./agent-service.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, writeCodexConfig } from "./config.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -57,6 +57,30 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
 }
 
 describe("Agent lifecycle", () => {
+  it("supports OpenRouter configuration", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-openrouter-"));
+    temporaryDirectories.push(root);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      OPENROUTER_API_KEY: "or-key",
+      OPENROUTER_MODEL: "openai/gpt-4.1-mini",
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1",
+    });
+
+    expect(config.openRouterApiKey).toBe("or-key");
+    expect(config.openRouterModel).toBe("openai/gpt-4.1-mini");
+    expect(config.openRouterBaseUrl).toBe("https://openrouter.ai/api/v1");
+
+    await writeCodexConfig(config);
+    const toml = await readFile(path.join(config.codexHome, "config.toml"), "utf8");
+    expect(toml).toContain('model_provider = "openrouter"');
+    expect(toml).toContain('base_url = "https://openrouter.ai/api/v1"');
+    expect(toml).toContain('env_key = "OPENROUTER_API_KEY"');
+  });
+
   it("creates, updates, stops, starts and deletes an Agent", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Builder" });
