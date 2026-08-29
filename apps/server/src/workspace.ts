@@ -1,5 +1,6 @@
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { DELEGATE_BLOCK_INSTRUCTIONS, formatRoster } from "./delegation.js";
 import type { Agent } from "./types.js";
 
 export class WorkspaceManager {
@@ -14,9 +15,9 @@ export class WorkspaceManager {
     await mkdir(path.join(this.root, ".deleted"), { recursive: true });
   }
 
-  async create(agent: Agent): Promise<void> {
+  async create(agent: Agent, roster: Agent[]): Promise<void> {
     await mkdir(agent.workspacePath, { recursive: false });
-    await this.writeInstructions(agent);
+    await this.writeInstructions(agent, roster);
     await writeFile(
       path.join(agent.workspacePath, ".gitignore"),
       [".codex/", "node_modules/", "dist/", ".env", "*.log", ""].join("\n"),
@@ -35,7 +36,7 @@ export class WorkspaceManager {
     );
   }
 
-  async writeInstructions(agent: Agent): Promise<void> {
+  async writeInstructions(agent: Agent, roster: Agent[]): Promise<void> {
     const content = [
       "# Platform-managed Agent instructions",
       "",
@@ -54,7 +55,13 @@ export class WorkspaceManager {
       "- Build and test changes when practical.",
       "- Never print environment variables or credentials.",
       "",
-      "This file is regenerated when the Agent configuration is updated.",
+      DELEGATE_BLOCK_INSTRUCTIONS,
+      "",
+      "### Agents available to delegate to",
+      "",
+      formatRoster(agent.id, roster),
+      "",
+      "This file is regenerated before every turn, so the list above is always current.",
       "",
     ]
       .filter((line, index, lines) => !(line === "" && lines[index - 1] === ""))

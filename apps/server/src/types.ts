@@ -45,6 +45,25 @@ export interface AgentRun {
   partial: boolean;
   /** Opaque runner-owned identity (e.g. "container:launchpad-default-<id>" or "pid:1234") used to reconcile after a restart. */
   runnerHandle: string | null;
+  /** The Run that delegated to this one via a `` ```delegate `` block, or null for a directly user-sent Run. */
+  parentRunId: string | null;
+  /**
+   * Set the moment this Run creates a child Run to delegate to, cleared once
+   * that child resolves and this Run's own loop resumes. This is the durable
+   * checkpoint that lets boot-time reconciliation tell "a leaf Run with no
+   * live process" apart from "an orchestrator mid-wait with no live
+   * process" -- both look identical as a bare `running` row otherwise -- and
+   * lets it resume this Run once the child's fate is known, even across a
+   * restart.
+   */
+  awaitingChildRunId: string | null;
+  /**
+   * Tree-wide count of delegation rounds so far, always read/written on the
+   * root Run of the delegation tree (found by walking `parentRunId` up), so
+   * the iteration safety cap applies across an entire orchestration chain,
+   * not per-Run, and survives a restart.
+   */
+  orchestrationIterationCount: number;
 }
 
 export interface Database {

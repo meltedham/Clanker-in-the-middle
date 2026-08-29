@@ -38,6 +38,8 @@ export interface AgentRun {
   createdAt: string;
   /** true if `output` was captured from an in-progress checkpoint rather than a natural completion. */
   partial?: boolean;
+  /** The Run that delegated to this one, if any -- not currently rendered anywhere in the UI. */
+  parentRunId?: string | null;
 }
 
 export type RunEventType =

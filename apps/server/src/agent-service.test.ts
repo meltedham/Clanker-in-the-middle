@@ -17,6 +17,37 @@ import type {
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
+/** A runner whose behavior per call is driven by a script keyed on the request and a per-agent call counter (1-indexed). */
+class ScriptedRunner implements AgentRunner {
+  readonly callCountByAgent = new Map<string, number>();
+
+  constructor(
+    private readonly script: (
+      request: RunnerRequest,
+      callNumberForAgent: number,
+    ) => RunnerResult | Promise<RunnerResult>,
+  ) {}
+
+  async run(request: RunnerRequest): Promise<RunnerResult> {
+    const callNumber = (this.callCountByAgent.get(request.agentId) ?? 0) + 1;
+    this.callCountByAgent.set(request.agentId, callNumber);
+    return this.script(request, callNumber);
+  }
+  async cancel(): Promise<boolean> {
+    return false;
+  }
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+  async reconcile(): Promise<ReconcileOutcome> {
+    return { stillRunning: false, reason: "not reachable in this fake" };
+  }
+}
+
+function delegateBlock(agent: string, task: string): string {
+  return "```delegate\nagent: " + agent + "\ntask: " + task + "\n```";
+}
+
 class FakeRunner implements AgentRunner {
   async run(request: RunnerRequest): Promise<RunnerResult> {
     return {
@@ -42,7 +73,12 @@ afterEach(async () => {
   const { rm } = await import("node:fs/promises");
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
+      // maxRetries/retryDelay absorb the occasional Windows ENOTEMPTY/EBUSY
+      // that happens when a fire-and-forget checkpoint write (e.g.
+      // AGENTS.md refresh mid delegation-loop) is still settling on disk
+      // right as the directory is removed -- this is a Windows filesystem
+      // timing quirk in the test's own cleanup, not product behavior.
+      rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
     ),
   );
 });
@@ -224,7 +260,7 @@ describe("Run interruption and recovery", () => {
       createdAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     };
-    await workspaces.create(agent);
+    await workspaces.create(agent, [agent]);
     const run: AgentRun = {
       id: "run-restart",
       agentId: "agent-restart",
@@ -299,7 +335,7 @@ describe("Run interruption and recovery", () => {
       createdAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     };
-    await workspaces.create(agent);
+    await workspaces.create(agent, [agent]);
     const run: AgentRun = {
       id: "run-gone",
       agentId: "agent-gone",
@@ -344,5 +380,453 @@ describe("Run interruption and recovery", () => {
     expect(finishedRun.output).toBe("checkpointed partial text");
     expect(finishedRun.partial).toBe(true);
     expect(service.getAgent("agent-gone").codexThreadId).toBe("thread-before-crash");
+  });
+});
+
+describe("Multi-agent delegation", () => {
+  it("delegates to another Agent and resumes on the same thread with its result", async () => {
+    let orchestratorId = "";
+    let researcherId = "";
+    const runner = new ScriptedRunner((request, callNumber) => {
+      if (request.agentId === orchestratorId && callNumber === 1) {
+        return {
+          output: "I'll ask Researcher.\n\n" + delegateBlock("Researcher", "find X"),
+          threadId: "orchestrator-thread-1",
+          usage: null,
+        };
+      }
+      if (request.agentId === researcherId) {
+        expect(request.prompt).toBe("find X");
+        return { output: "X is 42.", threadId: "researcher-thread-1", usage: null };
+      }
+      // orchestrator's second call: must resume the thread ITS first call
+      // produced, not the (null) pre-run thread, and must see the
+      // delegated result as its next prompt.
+      expect(request.threadId).toBe("orchestrator-thread-1");
+      expect(request.prompt).toContain("X is 42.");
+      return { output: "The answer is 42.", threadId: "orchestrator-thread-1", usage: null };
+    });
+
+    const service = await makeService(runner);
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    const researcher = await service.createAgent({ name: "Researcher" });
+    orchestratorId = orchestrator.id;
+    researcherId = researcher.id;
+
+    const { run } = await service.sendMessage(orchestrator.id, "kick off orchestration");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const finalRun = service.getRun(run.id);
+    expect(finalRun.output).toBe("The answer is 42.");
+    expect(finalRun.awaitingChildRunId).toBeNull();
+
+    const researcherRuns = service.getRuns(researcher.id);
+    expect(researcherRuns).toHaveLength(1);
+    expect(researcherRuns[0]?.parentRunId).toBe(run.id);
+    expect(researcherRuns[0]?.status).toBe("completed");
+
+    const researcherMessages = service.getMessages(researcher.id);
+    expect(researcherMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(researcherMessages[0]?.content).toBe("find X");
+  });
+
+  it("rejects self-delegation and lets the orchestrator recover on the same thread", async () => {
+    const runner = new ScriptedRunner((_request, callNumber) => {
+      if (callNumber === 1) {
+        return { output: delegateBlock("Solo", "help me"), threadId: "t1", usage: null };
+      }
+      return { output: "Fine, I'll do it myself.", threadId: "t1", usage: null };
+    });
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Solo" });
+    const { run } = await service.sendMessage(agent.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("Fine, I'll do it myself.");
+    expect(service.getRuns(agent.id)).toHaveLength(1); // no child run created
+  });
+
+  it("rejects delegating to a busy Agent without hard-failing the orchestration", async () => {
+    let finishTarget!: (result: RunnerResult) => void;
+    const targetPending = new Promise<RunnerResult>((resolve) => {
+      finishTarget = resolve;
+    });
+    let targetId = "";
+    let orchestratorId = "";
+    const runner = new ScriptedRunner((request, callNumber) => {
+      if (request.agentId === targetId) return targetPending;
+      if (request.agentId === orchestratorId && callNumber === 1) {
+        return { output: delegateBlock("Target", "x"), threadId: "t", usage: null };
+      }
+      expect(request.prompt).toMatch(/currently busy/i);
+      return { output: "ok, moving on", threadId: "t", usage: null };
+    });
+    const service = await makeService(runner);
+    const target = await service.createAgent({ name: "Target" });
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    targetId = target.id;
+    orchestratorId = orchestrator.id;
+
+    await service.sendMessage(target.id, "busy work"); // never resolves until finishTarget() below
+    const { run } = await service.sendMessage(orchestrator.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("ok, moving on");
+
+    finishTarget({ output: "done", threadId: "t", usage: null });
+  });
+
+  it("rejects a delegation cycle back to an active ancestor", async () => {
+    let orchestratorId = "";
+    const runner = new ScriptedRunner((request, callNumber) => {
+      if (request.agentId === orchestratorId) {
+        if (callNumber === 1) {
+          return { output: delegateBlock("Helper", "please help"), threadId: "t1", usage: null };
+        }
+        // Second call: after Helper gives up trying to delegate back.
+        expect(request.prompt).toMatch(/gave up on the cycle/i);
+        return { output: "orchestrator recovered", threadId: "t1", usage: null };
+      }
+      // Helper: first tries to delegate straight back to the still-active
+      // (still "busy") Orchestrator; that gets rejected, then it recovers.
+      if (callNumber === 1) {
+        return { output: delegateBlock("Orchestrator", "circular"), threadId: "h1", usage: null };
+      }
+      // Orchestrator is still "busy" (awaiting Helper), so the busy-check
+      // rejects this before the ancestor/cycle-walk check is even reached --
+      // both mechanisms would catch it, this exercises the one that fires
+      // first in this synchronous, single-active-run-per-agent design.
+      expect(request.prompt).toMatch(/orchestrator.*currently busy/is);
+      return { output: "gave up on the cycle", threadId: "h1", usage: null };
+    });
+    const service = await makeService(runner);
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    await service.createAgent({ name: "Helper" });
+    orchestratorId = orchestrator.id;
+
+    const { run } = await service.sendMessage(orchestrator.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("orchestrator recovered");
+  });
+
+  it("enforces a tree-wide iteration cap across nested orchestrators", async () => {
+    let orchestratorId = "";
+    let helperId = "";
+    // Both agents always try to delegate to each other -- without a cap this
+    // would loop forever (or until the cycle guard on the SAME ancestor
+    // stops it); use two agents that keep handing off to fresh targets is
+    // hard to model simply, so instead assert the run terminates
+    // deterministically rather than hanging, driven by the shared cap.
+    const runner = new ScriptedRunner((request) => {
+      if (request.agentId === orchestratorId) {
+        return { output: delegateBlock("Helper", "again"), threadId: "t", usage: null };
+      }
+      return { output: delegateBlock("Orchestrator", "again"), threadId: "h", usage: null };
+    });
+    const service = await makeService(runner);
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    const helper = await service.createAgent({ name: "Helper" });
+    orchestratorId = orchestrator.id;
+    helperId = helper.id;
+
+    const { run } = await service.sendMessage(orchestrator.id, "start");
+    await expect
+      .poll(() => service.getRun(run.id).status, { timeout: 5000 })
+      .not.toBe("running");
+    // Terminates one way or another (cap or cycle guard) instead of hanging;
+    // the combined call count across both agents must stay bounded.
+    const totalCalls =
+      (runner.callCountByAgent.get(orchestrator.id) ?? 0) +
+      (runner.callCountByAgent.get(helper.id) ?? 0);
+    expect(totalCalls).toBeLessThan(30);
+  });
+
+  it("never crashes on a malformed delegate block -- treats it as the final answer", async () => {
+    const service = await makeService(
+      new ScriptedRunner(() => ({
+        output: "```delegate\nagent: Nobody\n```", // missing task field
+        threadId: "t",
+        usage: null,
+      })),
+    );
+    const agent = await service.createAgent({ name: "Solo" });
+    const { run } = await service.sendMessage(agent.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toContain("```delegate");
+  });
+
+  it("stopping the orchestrator mid-delegation also stops the in-flight child", async () => {
+    // A real runner's cancel() kills the underlying process, which is what
+    // makes its own pending run() promise settle (reject) -- mimic that
+    // here instead of a no-op cancel(), or `cancelExecution`'s own `await
+    // execution` on the child would hang forever waiting for a run() call
+    // that nothing ever resolves.
+    let rejectChild: ((error: unknown) => void) | null = null;
+    let targetId = "";
+    let orchestratorId = "";
+    const runner: AgentRunner = {
+      run: async (request) => {
+        if (request.agentId === orchestratorId) {
+          return { output: delegateBlock("Target", "slow work"), threadId: "t", usage: null };
+        }
+        return new Promise<RunnerResult>((_resolve, reject) => {
+          rejectChild = reject;
+        });
+      },
+      cancel: async (agentId) => {
+        if (agentId === targetId && rejectChild) {
+          rejectChild(new RunCancelledError());
+          return true;
+        }
+        return false;
+      },
+      isAvailable: async () => true,
+      reconcile: async () => ({ stillRunning: false, reason: "n/a" }),
+    };
+    const service = await makeService(runner);
+    const target = await service.createAgent({ name: "Target" });
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    targetId = target.id;
+    orchestratorId = orchestrator.id;
+
+    const { run } = await service.sendMessage(orchestrator.id, "start");
+    await expect.poll(() => service.getRuns(target.id).length).toBeGreaterThan(0);
+    await expect.poll(() => service.getRun(service.getRuns(target.id)[0]!.id).status).toBe("running");
+
+    await service.stopAgent(orchestrator.id);
+
+    expect(service.getRun(run.id).status).not.toBe("running");
+    expect(service.getRuns(target.id)[0]?.status).not.toBe("running");
+  });
+});
+
+describe("Multi-agent delegation and reconciliation across a restart", () => {
+  it("re-parses a reattached container's recovered output for a delegate block instead of leaking it to the user", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
+    });
+    const store = new JsonStore(path.join(root, "data", "db.json"));
+    const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
+    await store.initialize();
+    await workspaces.initialize();
+
+    const orchestrator: Agent = {
+      id: "orchestrator",
+      name: "Orchestrator",
+      description: "",
+      instructions: "",
+      status: "busy",
+      workspacePath: workspaces.workspacePath("orchestrator"),
+      codexThreadId: null,
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    const helper: Agent = {
+      id: "helper",
+      name: "Helper",
+      description: "",
+      instructions: "",
+      status: "ready",
+      workspacePath: workspaces.workspacePath("helper"),
+      codexThreadId: null,
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    await workspaces.create(orchestrator, [orchestrator, helper]);
+    await workspaces.create(helper, [orchestrator, helper]);
+    const run: AgentRun = {
+      id: "run-reattach",
+      agentId: "orchestrator",
+      status: "running",
+      prompt: "do something that outlives the server",
+      output: null,
+      error: null,
+      usage: null,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      completedAt: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      partial: false,
+      runnerHandle: "container:launchpad-default-orchestrator",
+      parentRunId: null,
+      awaitingChildRunId: null,
+      orchestrationIterationCount: 0,
+    };
+    await store.mutate((database) => {
+      database.agents.push(orchestrator, helper);
+      database.runs.push(run);
+    });
+
+    const runner: AgentRunner = {
+      run: async (request) => {
+        // The resumed second call (after the recovered delegate block is
+        // acted on) should finish normally.
+        if (request.agentId === "helper") {
+          return { output: "helped!", threadId: "helper-thread", usage: null };
+        }
+        return { output: "final answer after delegation", threadId: "orchestrator-thread-2", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async (): Promise<ReconcileOutcome> => ({
+        stillRunning: true,
+        reason: "Reattached to a running container",
+        result: {
+          output: delegateBlock("Helper", "help me"),
+          threadId: "orchestrator-thread-1",
+          usage: null,
+        },
+      }),
+    };
+
+    const service = new AgentService(config, store, workspaces, runner);
+    await service.initialize();
+
+    const finalRun = service.getRun("run-reattach");
+    expect(finalRun.status).toBe("completed");
+    // The raw fenced block must never be presented as the user-visible answer.
+    expect(finalRun.output).not.toContain("```delegate");
+    expect(finalRun.output).toBe("final answer after delegation");
+    const helperRuns = service.getRuns("helper");
+    expect(helperRuns).toHaveLength(1);
+    expect(helperRuns[0]?.parentRunId).toBe("run-reattach");
+  });
+
+  it("resumes an orchestrator across a restart once its already-finished child is known", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
+    });
+    const store = new JsonStore(path.join(root, "data", "db.json"));
+    const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
+    await store.initialize();
+    await workspaces.initialize();
+
+    const parentAgent: Agent = {
+      id: "parent-agent",
+      name: "Parent",
+      description: "",
+      instructions: "",
+      status: "busy",
+      workspacePath: workspaces.workspacePath("parent-agent"),
+      codexThreadId: "parent-thread",
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    const childAgent: Agent = {
+      id: "child-agent",
+      name: "Child",
+      description: "",
+      instructions: "",
+      status: "ready",
+      workspacePath: workspaces.workspacePath("child-agent"),
+      codexThreadId: "child-thread",
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    await workspaces.create(parentAgent, [parentAgent, childAgent]);
+    await workspaces.create(childAgent, [parentAgent, childAgent]);
+
+    // The parent run was killed while genuinely "between iterations" --
+    // its own runner call already exited (nothing to reattach to), but it
+    // was waiting on the child, which is what makes this different from
+    // ordinary single-run reconciliation.
+    const parentRun: AgentRun = {
+      id: "parent-run",
+      agentId: "parent-agent",
+      status: "running",
+      prompt: "delegate this out",
+      output: "I'll ask Child.",
+      error: null,
+      usage: null,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      completedAt: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      partial: true,
+      runnerHandle: null,
+      parentRunId: null,
+      awaitingChildRunId: "child-run",
+      orchestrationIterationCount: 1,
+    };
+    // The child, by contrast, genuinely finished successfully before the
+    // crash (or gets reconciled to a real result below) -- either way its
+    // outcome is known.
+    const childRun: AgentRun = {
+      id: "child-run",
+      agentId: "child-agent",
+      status: "running",
+      prompt: "the delegated task",
+      output: null,
+      error: null,
+      usage: null,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      completedAt: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      partial: false,
+      runnerHandle: "container:launchpad-default-child-agent",
+      parentRunId: "parent-run",
+      awaitingChildRunId: null,
+      orchestrationIterationCount: 0,
+    };
+    await store.mutate((database) => {
+      database.agents.push(parentAgent, childAgent);
+      database.runs.push(parentRun, childRun);
+    });
+
+    const runner: AgentRunner = {
+      run: async (request) => {
+        // The parent's resumption call, once the child's result is known.
+        expect(request.agentId).toBe("parent-agent");
+        expect(request.threadId).toBe("parent-thread");
+        expect(request.prompt).toContain("child finished the task");
+        return { output: "done, using the child's result", threadId: "parent-thread-2", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async (agentId): Promise<ReconcileOutcome> => {
+        if (agentId === "parent-agent") {
+          // Nothing to reattach to for the parent itself -- it was between
+          // iterations, not mid-call.
+          return { stillRunning: false, reason: "Local-process Runs cannot be reattached after a server restart" };
+        }
+        // The child's own container was genuinely still running and gets
+        // reattached with a real result.
+        return {
+          stillRunning: true,
+          reason: "Reattached to a running container",
+          result: { output: "child finished the task", threadId: "child-thread-2", usage: null },
+        };
+      },
+    };
+
+    const service = new AgentService(config, store, workspaces, runner);
+    await service.initialize();
+
+    // The key assertion: the parent must NOT be stuck "cancelled" just
+    // because there was no live process to reattach it to directly -- it
+    // must have been resumed once the child's fate became known.
+    const finalParentRun = service.getRun("parent-run");
+    expect(finalParentRun.status).toBe("completed");
+    expect(finalParentRun.output).toBe("done, using the child's result");
+    expect(finalParentRun.awaitingChildRunId).toBeNull();
+    expect(service.getAgent("parent-agent").status).toBe("ready");
+
+    const finalChildRun = service.getRun("child-run");
+    expect(finalChildRun.status).toBe("completed");
+    expect(finalChildRun.output).toBe("child finished the task");
   });
 });
