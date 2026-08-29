@@ -43,6 +43,21 @@ export interface AgentRun {
   createdAt: string;
 }
 
+export type RagSourceType = "workspace" | "shared" | "message";
+
+export interface RagMatch {
+  sourceType: RagSourceType;
+  sourceId: string;
+  title: string;
+  content: string;
+  score: number;
+}
+
+export interface RagContext {
+  prompt: string;
+  matches: RagMatch[];
+}
+
 export interface Database {
   version: 1;
   agents: Agent[];
@@ -73,6 +88,10 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
+}
+
+export interface EmbeddingClient {
+  embed(texts: string[]): Promise<number[][]>;
 }
 
 export interface AgentRunner {

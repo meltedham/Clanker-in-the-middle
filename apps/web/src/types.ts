@@ -38,6 +38,12 @@ export interface AgentRun {
   createdAt: string;
 }
 
+export interface ResourceSummary {
+  name: string;
+  size: number;
+  updatedAt: string;
+}
+
 export interface SystemInfo {
   arkConfigured: boolean;
   arkBaseUrl: string;

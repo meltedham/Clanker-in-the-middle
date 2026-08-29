@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,7 +9,10 @@ import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
+  public readonly prompts: string[] = [];
+
   async run(request: RunnerRequest): Promise<RunnerResult> {
+    this.prompts.push(request.prompt);
     return {
       output: "Completed: " + request.prompt,
       threadId: request.threadId ?? "fake-thread",
@@ -102,6 +105,54 @@ describe("Agent lifecycle", () => {
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1]?.content).toContain("write hello world");
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
+  });
+
+  it("enriches the runner prompt with workspace, shared resources, and old messages", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-rag-"));
+    temporaryDirectories.push(root);
+    const runner = new FakeRunner();
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      SHARED_RESOURCE_ROOT: path.join(root, "shared"),
+      CODEX_HOME: path.join(root, "codex"),
+      ARK_API_KEY: "test-key",
+      ARK_MODEL: "ep-test",
+    });
+    const service = new AgentService(
+      config,
+      new JsonStore(path.join(root, "data", "db.json")),
+      new WorkspaceManager(path.join(root, "workspaces")),
+      runner,
+    );
+    await service.initialize();
+
+    const agent = await service.createAgent({ name: "Retriever" });
+    await mkdir(config.sharedResourceRoot, { recursive: true });
+    await writeFile(
+      path.join(agent.workspacePath, "workspace-notes.md"),
+      "Workspace clue: the widget integration depends on cached summaries.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(config.sharedResourceRoot, "shared-notes.md"),
+      "Shared resource clue: the widget integration is documented for all agents.",
+      "utf8",
+    );
+
+    await service.sendMessage(agent.id, "remember widget integration details");
+    await expect.poll(() => service.getRun(service.getRuns(agent.id)[0].id).status).toBe(
+      "completed",
+    );
+
+    await service.sendMessage(agent.id, "how should I wire the widget integration?");
+    await expect.poll(() => service.getRuns(agent.id)).toHaveLength(2);
+
+    const enrichedPrompt = runner.prompts.at(-1) ?? "";
+    expect(enrichedPrompt).toContain("Workspace clue");
+    expect(enrichedPrompt).toContain("Shared resource clue");
+    expect(enrichedPrompt).toContain("remember widget integration details");
   });
 
   it("atomically accepts only one concurrent run per Agent", async () => {

@@ -10,6 +10,14 @@ import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const resourceNameParams = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .regex(/^[^/\\]+$/, "Resource names must not contain path separators"),
+});
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
@@ -21,6 +29,10 @@ const updateAgentBody = createAgentBody.partial().refine(
 );
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
+});
+const uploadBody = z.object({
+  name: z.string().trim().min(1).max(200).regex(/^[^/\\]+$/),
+  content: z.string().max(1_000_000),
 });
 
 export async function createApp(
@@ -116,11 +128,48 @@ export async function createApp(
     return { runs: service.getRuns(id) };
   });
 
+  app.get("/api/agents/:id/uploads", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { uploads: await service.listUploads(id) };
+  });
+
+  app.post("/api/agents/:id/uploads", async (request, reply) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = uploadBody.parse(request.body);
+    return reply.code(201).send({
+      upload: await service.uploadAgentResource(id, body.name, body.content),
+    });
+  });
+
+  app.delete("/api/agents/:id/uploads/:name", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const { name } = resourceNameParams.parse(request.params);
+    await service.deleteAgentUpload(id, name);
+    return { ok: true };
+  });
+
   app.post("/api/agents/:id/messages", async (request, reply) => {
     const { id } = agentIdParams.parse(request.params);
     const body = messageBody.parse(request.body);
     const result = await service.sendMessage(id, body.content);
     return reply.code(202).send(result);
+  });
+
+  app.get("/api/shared-resources", async () => ({
+    resources: await service.listSharedResources(),
+  }));
+
+  app.post("/api/shared-resources", async (request, reply) => {
+    const body = uploadBody.parse(request.body);
+    return reply.code(201).send({
+      resource: await service.uploadSharedResource(body.name, body.content),
+    });
+  });
+
+  app.delete("/api/shared-resources/:name", async (request) => {
+    const { name } = resourceNameParams.parse(request.params);
+    await service.deleteSharedResource(name);
+    return { ok: true };
   });
 
   app.get("/api/runs/:id", async (request) => {

@@ -498,6 +498,77 @@ button {
   box-shadow: 0 12px 36px rgba(43, 42, 38, 0.06);
 }
 
+.resource-grid {
+  max-width: 1180px;
+  margin: 0 auto 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.resource-panel {
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 36px rgba(43, 42, 38, 0.06);
+}
+
+.resource-panel-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.resource-panel h2 {
+  margin: 3px 0 0;
+  font-size: 16px;
+}
+
+.resource-panel label {
+  display: block;
+  margin-top: 13px;
+}
+
+.resource-list {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 10px;
+}
+
+.resource-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e2e0d7;
+  border-radius: 11px;
+  background: #fffdf9;
+}
+
+.resource-row strong,
+.resource-row span {
+  display: block;
+}
+
+.resource-row strong {
+  font-size: 12px;
+}
+
+.resource-row span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.resource-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .settings-panel {
   padding: 20px;
   border-radius: 14px;

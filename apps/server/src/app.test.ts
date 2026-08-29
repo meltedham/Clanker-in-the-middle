@@ -6,6 +6,20 @@ import type { AgentService } from "./agent-service.js";
 const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
+  listUploads: async () => [],
+  uploadAgentResource: async (_agentId: string, name: string, content: string) => ({
+    name,
+    size: content.length,
+    updatedAt: new Date().toISOString(),
+  }),
+  deleteAgentUpload: async () => undefined,
+  listSharedResources: async () => [],
+  uploadSharedResource: async (name: string, content: string) => ({
+    name,
+    size: content.length,
+    updatedAt: new Date().toISOString(),
+  }),
+  deleteSharedResource: async () => undefined,
 } as unknown as AgentService;
 
 describe("HTTP boundary", () => {
@@ -43,6 +57,31 @@ describe("HTTP boundary", () => {
       payload: JSON.stringify({ name: "x".repeat(1_100_000) }),
     });
     expect(oversized.statusCode).toBe(413);
+    await app.close();
+  });
+
+  it("supports shared resources and workspace uploads", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), service);
+
+    const sharedUpload = await app.inject({
+      method: "POST",
+      url: "/api/shared-resources",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ name: "shared.md", content: "shared context" }),
+    });
+    expect(sharedUpload.statusCode).toBe(201);
+
+    const sharedList = await app.inject({ method: "GET", url: "/api/shared-resources" });
+    expect(sharedList.statusCode).toBe(200);
+
+    const agentUpload = await app.inject({
+      method: "POST",
+      url: "/api/agents/123e4567-e89b-12d3-a456-426614174000/uploads",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ name: "upload.md", content: "agent context" }),
+    });
+    expect(agentUpload.statusCode).toBe(201);
+
     await app.close();
   });
 });

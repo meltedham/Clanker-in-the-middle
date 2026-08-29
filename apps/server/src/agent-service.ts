@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isModelConfigured, isOpenRouterConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import { RagService } from "./rag-service.js";
 import { JsonStore } from "./store.js";
+import { SharedResourceManager } from "./shared-resource-manager.js";
 import type {
   Agent,
   AgentRun,
@@ -18,17 +20,23 @@ const now = () => new Date().toISOString();
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly ragService: RagService;
+  private readonly sharedResources: SharedResourceManager;
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
-  ) {}
+  ) {
+    this.ragService = new RagService(config, store);
+    this.sharedResources = new SharedResourceManager(config.sharedResourceRoot);
+  }
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.sharedResources.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
         if (run.status === "queued" || run.status === "running") {
@@ -114,6 +122,40 @@ export class AgentService {
       database.runs = database.runs.filter((item) => item.agentId !== id);
     });
     return { archivedWorkspace };
+  }
+
+  async listSharedResources(): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
+    return this.sharedResources.list();
+  }
+
+  async uploadSharedResource(
+    name: string,
+    content: string,
+  ): Promise<{ name: string; size: number; updatedAt: string }> {
+    return this.sharedResources.write(name, content);
+  }
+
+  async deleteSharedResource(name: string): Promise<void> {
+    await this.sharedResources.delete(name);
+  }
+
+  async listUploads(agentId: string): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
+    this.getAgent(agentId);
+    return this.workspaces.listUploads(agentId);
+  }
+
+  async uploadAgentResource(
+    agentId: string,
+    name: string,
+    content: string,
+  ): Promise<{ name: string; size: number; updatedAt: string }> {
+    this.getAgent(agentId);
+    return this.workspaces.writeUpload(agentId, name, content);
+  }
+
+  async deleteAgentUpload(agentId: string, name: string): Promise<void> {
+    this.getAgent(agentId);
+    await this.workspaces.deleteUpload(agentId, name);
   }
 
   async startAgent(id: string): Promise<Agent> {
@@ -247,10 +289,11 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      const ragContext = await this.ragService.buildContext(agentAtStart, run.prompt, run.id);
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
-        prompt: run.prompt,
+        prompt: ragContext.prompt,
         threadId: agentAtStart.codexThreadId,
       });
       const completedAt = now();

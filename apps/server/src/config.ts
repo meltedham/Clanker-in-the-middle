@@ -16,6 +16,7 @@ const envSchema = z.object({
   CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
   RUNTIME_PROVIDER: z.enum(["local-process", "container"]).default("local-process"),
+  SHARED_RESOURCE_ROOT: z.string().default(path.resolve("shared-resources")),
   CONTAINER_ENGINE: z.string().min(1).default("docker"),
   CONTAINER_RUNTIME_IMAGE: z.string().min(1).default("volc-agent-runtime:local"),
   CONTAINER_CPU_LIMIT: z.coerce.number().positive().default(2),
@@ -40,6 +41,7 @@ const envSchema = z.object({
     .optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OPENROUTER_MODEL: z.string().optional(),
+  OPENROUTER_EMBEDDING_MODEL: z.string().optional(),
   OPENROUTER_BASE_URL: z
     .string()
     .url()
@@ -100,10 +102,16 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     openRouterApiKey,
     openRouterModel,
     openRouterBaseUrl,
+    sharedResourceRoot: path.resolve(env.SHARED_RESOURCE_ROOT),
+    openRouterEmbeddingModel: env.OPENROUTER_EMBEDDING_MODEL?.trim() ?? "",
     arkApiKey,
     arkModel,
     arkBaseUrl,
     nodeEnv: env.NODE_ENV,
+    ragTopK: 8,
+    ragChunkSize: 1_200,
+    ragScanLimit: 200,
+    ragMaxContextChars: 12_000,
   };
 }
 

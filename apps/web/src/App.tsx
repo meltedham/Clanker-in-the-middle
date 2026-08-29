@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, ResourceSummary, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
   "Inspect this workspace and explain what you would improve first.",
   "Build a responsive single-page todo app with tests.",
 ];
+
+const emptyResourceForm = {
+  name: "",
+  content: "",
+};
 
 const emptyForm = {
   name: "",
@@ -44,6 +49,10 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
+  const [uploads, setUploads] = useState<ResourceSummary[]>([]);
+  const [sharedResources, setSharedResources] = useState<ResourceSummary[]>([]);
+  const [uploadForm, setUploadForm] = useState(emptyResourceForm);
+  const [sharedForm, setSharedForm] = useState(emptyResourceForm);
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -77,9 +86,23 @@ export default function App() {
     }
   }, []);
 
+  const refreshUploads = useCallback(async (agentId: string) => {
+    const result = await api.uploads(agentId);
+    if (mountedRef.current && selectedIdRef.current === agentId) {
+      setUploads(result.uploads);
+    }
+  }, []);
+
+  const refreshSharedResources = useCallback(async () => {
+    const result = await api.sharedResources();
+    if (mountedRef.current) {
+      setSharedResources(result.resources);
+    }
+  }, []);
+
   const bootstrap = useCallback(async () => {
-    await Promise.all([refreshAgents(), api.system().then(setSystem)]);
-  }, [refreshAgents]);
+    await Promise.all([refreshAgents(), refreshSharedResources(), api.system().then(setSystem)]);
+  }, [refreshAgents, refreshSharedResources]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -101,10 +124,11 @@ export default function App() {
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
+      setUploads([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
-      .then(([, result]) => {
+    void Promise.all([refreshMessages(selectedId), refreshUploads(selectedId), api.runs(selectedId)])
+      .then(([, , result]) => {
         if (selectedIdRef.current !== selectedId) return;
         const latest = result.runs[0] ?? null;
         setActiveRun(latest);
@@ -117,7 +141,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, refreshUploads, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -194,6 +218,64 @@ export default function App() {
     try {
       await api.deleteAgent(selected.id);
       await refreshAgents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const publishSharedResource = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await api.createSharedResource(sharedForm);
+      setSharedForm(emptyResourceForm);
+      await refreshSharedResources();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadWorkspaceResource = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.uploadAgentResource(selected.id, uploadForm);
+      setUploadForm(emptyResourceForm);
+      await refreshUploads(selected.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteShared = async (name: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteSharedResource(name);
+      await refreshSharedResources();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteUpload = async (name: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteAgentUpload(selected.id, name);
+      await refreshUploads(selected.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -476,6 +558,114 @@ export default function App() {
                 </div>
               </form>
             )}
+
+            <section className="resource-grid">
+              <form className="resource-panel" onSubmit={uploadWorkspaceResource}>
+                <div className="resource-panel-heading">
+                  <div>
+                    <span className="eyebrow">Workspace uploads</span>
+                    <h2>Private context</h2>
+                  </div>
+                </div>
+                <label>
+                  File name
+                  <input
+                    value={uploadForm.name}
+                    onChange={(event) => setUploadForm({ ...uploadForm, name: event.target.value })}
+                    placeholder="notes.md"
+                    maxLength={200}
+                  />
+                </label>
+                <label>
+                  Content
+                  <textarea
+                    value={uploadForm.content}
+                    onChange={(event) =>
+                      setUploadForm({ ...uploadForm, content: event.target.value })
+                    }
+                    rows={5}
+                    placeholder="Paste a document to add it to this Agent's RAG corpus."
+                    maxLength={1_000_000}
+                  />
+                </label>
+                <div className="resource-list">
+                  {uploads.length > 0 ? (
+                    uploads.map((item) => (
+                      <div className="resource-row" key={item.name}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <span>{Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+                        </div>
+                        <button type="button" className="button button-ghost" onClick={() => deleteUpload(item.name)}>
+                          Delete
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="resource-empty">No uploads yet for this Agent.</p>
+                  )}
+                </div>
+                <div className="panel-footer">
+                  <span>Stored inside {selected.name}&apos;s workspace</span>
+                  <button className="button button-primary" disabled={busy || !uploadForm.name.trim() || !uploadForm.content.trim()}>
+                    {busy ? <Spinner /> : "Upload resource"}
+                  </button>
+                </div>
+              </form>
+
+              <form className="resource-panel" onSubmit={publishSharedResource}>
+                <div className="resource-panel-heading">
+                  <div>
+                    <span className="eyebrow">Shared resources</span>
+                    <h2>Reusable context</h2>
+                  </div>
+                </div>
+                <label>
+                  File name
+                  <input
+                    value={sharedForm.name}
+                    onChange={(event) => setSharedForm({ ...sharedForm, name: event.target.value })}
+                    placeholder="shared-notes.md"
+                    maxLength={200}
+                  />
+                </label>
+                <label>
+                  Content
+                  <textarea
+                    value={sharedForm.content}
+                    onChange={(event) =>
+                      setSharedForm({ ...sharedForm, content: event.target.value })
+                    }
+                    rows={5}
+                    placeholder="Paste content that all authorized agents can retrieve."
+                    maxLength={1_000_000}
+                  />
+                </label>
+                <div className="resource-list">
+                  {sharedResources.length > 0 ? (
+                    sharedResources.map((item) => (
+                      <div className="resource-row" key={item.name}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <span>{Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+                        </div>
+                        <button type="button" className="button button-ghost" onClick={() => deleteShared(item.name)}>
+                          Delete
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="resource-empty">No shared resources yet.</p>
+                  )}
+                </div>
+                <div className="panel-footer">
+                  <span>Available to all authorized agents via RAG</span>
+                  <button className="button button-primary" disabled={busy || !sharedForm.name.trim() || !sharedForm.content.trim()}>
+                    {busy ? <Spinner /> : "Publish shared resource"}
+                  </button>
+                </div>
+              </form>
+            </section>
 
             <section className="playground">
               <div className="playground-topbar">
