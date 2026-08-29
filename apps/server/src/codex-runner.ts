@@ -165,7 +165,13 @@ export class CodexRunner implements AgentRunner {
       env: this.childEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
     });
-    callbacks?.onHandle?.("pid:" + child.pid);
+    // child.pid is undefined when the OS fails to spawn the process at all
+    // (e.g. ENOENT for a missing codexBin) -- only report a handle once
+    // there's a real pid to report, so `AgentRun.runnerHandle` and the
+    // observability trace never end up with a meaningless "pid:undefined".
+    if (child.pid !== undefined) {
+      callbacks?.onHandle?.("pid:" + child.pid);
+    }
     const settled = new Promise<void>((resolve) => {
       child.once("close", () => resolve());
       child.once("error", () => resolve());
@@ -306,7 +312,7 @@ export class CodexRunner implements AgentRunner {
     ] as const;
     const environment: NodeJS.ProcessEnv = {
       CODEX_HOME: this.config.codexHome,
-      ARK_API_KEY: this.config.arkApiKey,
+      OPENROUTER_API_KEY: this.config.openRouterApiKey,
       NO_COLOR: "1",
     };
     for (const name of inheritedNames) {

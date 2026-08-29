@@ -20,7 +20,7 @@ async function makeRoot(): Promise<string> {
 
 describe("redact", () => {
   it("scrubs secret-shaped strings", () => {
-    expect(redact("using ARK_API_KEY=abcd1234efgh5678 now")).toBe("using [redacted] now");
+    expect(redact("using OPENROUTER_API_KEY=abcd1234efgh5678 now")).toBe("using [redacted] now");
     expect(redact("Authorization: Bearer abcd1234efgh5678")).toBe("Authorization: [redacted]");
     expect(redact("sk-abcd1234efgh5678wxyz")).toBe("[redacted]");
     expect(redact("nothing secret here")).toBe("nothing secret here");
@@ -76,7 +76,7 @@ describe("TraceWriter", () => {
       agentId: "agent-1",
       type: "error",
       occurredAt: "2024-01-01T00:00:00.000Z",
-      summary: "failed using ARK_API_KEY=abcd1234efgh5678",
+      summary: "failed using OPENROUTER_API_KEY=abcd1234efgh5678",
       detail: { header: "Authorization: Bearer abcd1234efgh5678" },
     });
 

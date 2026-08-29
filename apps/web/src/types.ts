@@ -61,9 +61,9 @@ export interface RunEvent {
 }
 
 export interface SystemInfo {
-  arkConfigured: boolean;
-  arkBaseUrl: string;
-  arkModel: string | null;
+  openRouterConfigured: boolean;
+  openRouterBaseUrl: string;
+  openRouterModel: string | null;
   codexAvailable: boolean;
   codexSandboxMode: string;
   runtimeProvider: "local-process" | "container";

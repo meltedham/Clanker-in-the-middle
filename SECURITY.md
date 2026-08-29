@@ -17,13 +17,13 @@ credentials, personal data, or exploit details in an issue.
 - Ordinary local containers, not hardened multi-tenant sandboxes
 - Broad outbound network access
 - Prompt-triggered command and file execution
-- Ark key available to the server and active Runtime container
-- Ark key stored in Terraform POC state
+- OpenRouter key available to the server and active Runtime container
+- OpenRouter key stored in Terraform POC state
 
 ## Safe use
 
 - Use a dedicated development machine or disposable ECS instance.
-- Use a scoped, revocable Ark key and a unique `APP_AUTH_TOKEN`.
+- Use a scoped, revocable OpenRouter key and a unique `APP_AUTH_TOKEN`.
 - Keep local use on loopback and restrict ECS Web and SSH CIDRs.
 - Add HTTPS before sending the shared token over an untrusted network.
 - Never mount production data or provide Volcengine account AK/SK to Agents.

@@ -122,3 +122,34 @@ describe("CodexRunner reconciliation", () => {
     expect(outcome.reason).toMatch(/cannot be reattached/i);
   });
 });
+
+describe("CodexRunner run() against a missing binary", () => {
+  it("never reports a 'pid:undefined' handle, even when the OS fails to spawn the process", async () => {
+    // Regression test: observed live (on Windows) that spawning a
+    // nonexistent codexBin can report `child.pid === undefined`
+    // synchronously (ENOENT), which used to surface as a meaningless
+    // "pid:undefined" runner handle in AgentRun.runnerHandle and the
+    // observability trace. Whether `child.pid` is defined at spawn-failure
+    // time is itself platform-dependent (POSIX typically still assigns a
+    // pid before the async ENOENT; Windows can report it undefined), so
+    // this asserts the portable invariant -- if a handle is reported at
+    // all, it's never a meaningless one -- rather than whether one fires.
+    const runner = new CodexRunner(
+      loadConfig({ NODE_ENV: "test", CODEX_BIN: "definitely-not-a-real-codex-binary-xyz" }),
+    );
+    const handles: string[] = [];
+    await expect(
+      runner.run(
+        {
+          agentId: "agent-1",
+          runId: "run-1",
+          workspacePath: process.cwd(),
+          prompt: "hi",
+          threadId: null,
+        },
+        { onHandle: (handle) => handles.push(handle) },
+      ),
+    ).rejects.toThrow();
+    expect(handles).not.toContain("pid:undefined");
+  });
+});

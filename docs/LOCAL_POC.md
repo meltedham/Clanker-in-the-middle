@@ -2,7 +2,7 @@
 
 The local profile runs the React/Fastify control plane on macOS or Linux and
 starts every Codex turn in a disposable Docker, Colima, or Podman container.
-Only the Volcengine Ark model API is remote.
+Only the OpenRouter model API is remote.
 
 ## Start
 
@@ -10,10 +10,10 @@ Requirements:
 
 - Node.js 22+
 - Docker, Colima, or Podman
-- An Ark API key and Responses-capable endpoint
+- An OpenRouter API key and model slug
 
 ```bash
-ARK_API_KEY=your-ark-api-key ARK_MODEL=ep-your-endpoint-id npm run poc
+OPENROUTER_API_KEY=your-openrouter-api-key OPENROUTER_MODEL=openai/gpt-4o-mini npm run poc
 ```
 
 Open <http://localhost:3000>. Press `Ctrl+C` to stop the server and remove this
@@ -87,8 +87,8 @@ podman run --rm docker.io/library/alpine:3.20 echo PODMAN_OK
 
 ```bash
 CONTAINER_ENGINE=podman \
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
+OPENROUTER_API_KEY=your-openrouter-api-key \
+OPENROUTER_MODEL=openai/gpt-4o-mini \
 npm run poc
 ```
 
@@ -100,8 +100,8 @@ build.
 
 ```bash
 CONTAINER_RUNTIME_APT_PACKAGES='ca-certificates git ripgrep python3 build-essential' \
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
+OPENROUTER_API_KEY=your-openrouter-api-key \
+OPENROUTER_MODEL=openai/gpt-4o-mini \
 npm run poc
 ```
 

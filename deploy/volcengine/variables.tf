@@ -59,8 +59,8 @@ variable "repository_ref" {
   default     = "main"
 }
 
-variable "ark_api_key" {
-  description = "Volcengine Ark API key. Supplied through TF_VAR_ark_api_key."
+variable "openrouter_api_key" {
+  description = "OpenRouter API key. Supplied through TF_VAR_openrouter_api_key."
   type        = string
   sensitive   = true
 }
@@ -75,13 +75,13 @@ variable "app_auth_token" {
   }
 }
 
-variable "ark_model" {
-  description = "Ark endpoint/model ID supporting the Responses API."
+variable "openrouter_model" {
+  description = "Full OpenRouter model slug supporting the Responses API, e.g. openai/gpt-4o-mini."
   type        = string
 }
 
-variable "ark_base_url" {
-  description = "Ark OpenAI-compatible API base URL."
+variable "openrouter_base_url" {
+  description = "OpenRouter OpenAI-compatible API base URL."
   type        = string
-  default     = "https://ark.cn-beijing.volces.com/api/v3"
+  default     = "https://openrouter.ai/api/v1"
 }

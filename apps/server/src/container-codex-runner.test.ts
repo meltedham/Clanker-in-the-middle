@@ -9,8 +9,8 @@ describe("Container Codex runner", () => {
   it("builds an isolated Docker/Podman-compatible invocation", () => {
     const config = loadConfig({
       NODE_ENV: "test",
-      ARK_API_KEY: "secret-that-must-not-appear-in-argv",
-      ARK_MODEL: "ep-test",
+      OPENROUTER_API_KEY: "secret-that-must-not-appear-in-argv",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
       CODEX_HOME: "/tmp/codex-home",
       RUNTIME_PROVIDER: "container",
       CONTAINER_ENGINE: "podman",

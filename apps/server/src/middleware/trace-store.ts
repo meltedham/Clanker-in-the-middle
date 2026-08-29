@@ -30,7 +30,7 @@ export interface TraceReader {
   read(runId: string): Promise<RunEvent[]>;
 }
 
-const SECRET_PATTERN = /(sk-|ARK_API_KEY[=:]?\s*|Bearer\s+)[A-Za-z0-9._-]{8,}/gi;
+const SECRET_PATTERN = /(sk-|OPENROUTER_API_KEY[=:]?\s*|Bearer\s+)[A-Za-z0-9._-]{8,}/gi;
 
 export function redact(value: string): string {
   return value.replace(SECRET_PATTERN, "[redacted]");

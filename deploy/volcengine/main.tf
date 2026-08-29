@@ -35,9 +35,9 @@ locals {
     "PUBLIC_PORT=80",
     "LOG_LEVEL=info",
     "APP_AUTH_TOKEN=${var.app_auth_token}",
-    "ARK_API_KEY=${var.ark_api_key}",
-    "ARK_MODEL=${var.ark_model}",
-    "ARK_BASE_URL=${var.ark_base_url}",
+    "OPENROUTER_API_KEY=${var.openrouter_api_key}",
+    "OPENROUTER_MODEL=${var.openrouter_model}",
+    "OPENROUTER_BASE_URL=${var.openrouter_base_url}",
     "APP_DATA_DIR=/app/data",
     "AGENT_WORKSPACE_ROOT=/app/workspaces",
     "CODEX_HOME=/app/codex-home",
@@ -86,7 +86,7 @@ resource "volcenginecc_vpc_security_group" "launchpad" {
   ingress_permissions = local.ingress_permissions
   egress_permissions = [
     {
-      description     = "Outbound access for Ark, Git and package registries"
+      description     = "Outbound access for OpenRouter, Git and package registries"
       direction       = "egress"
       policy          = "accept"
       port_end        = -1

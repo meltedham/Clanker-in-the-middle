@@ -55,8 +55,8 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     APP_DATA_DIR: path.join(root, "data"),
     AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
     CODEX_HOME: path.join(root, "codex"),
-    ARK_API_KEY: "test-key",
-    ARK_MODEL: "ep-test",
+    OPENROUTER_API_KEY: "test-key",
+    OPENROUTER_MODEL: "openai/gpt-4o-mini",
   });
   const service = new AgentService(
     config,
@@ -180,8 +180,8 @@ describe("Run interruption and recovery", () => {
       APP_DATA_DIR: path.join(root, "data"),
       AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
       CODEX_HOME: path.join(root, "codex"),
-      ARK_API_KEY: "test-key",
-      ARK_MODEL: "ep-test",
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
     });
     const store = new JsonStore(path.join(root, "data", "db.json"));
     const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
@@ -255,8 +255,8 @@ describe("Run interruption and recovery", () => {
       APP_DATA_DIR: path.join(root, "data"),
       AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
       CODEX_HOME: path.join(root, "codex"),
-      ARK_API_KEY: "test-key",
-      ARK_MODEL: "ep-test",
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
     });
     const store = new JsonStore(path.join(root, "data", "db.json"));
     const workspaces = new WorkspaceManager(path.join(root, "workspaces"));

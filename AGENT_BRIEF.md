@@ -4,7 +4,7 @@
 
 Volc Agent Launchpad is a minimal single-user agent platform intended for hackathon or local proof-of-concept use. It gives users a browser-based workspace to create coding agents, configure their instructions, send tasks, and let an AI agent inspect files, modify code, and run commands in a persistent workspace.
 
-The system is built around OpenAI-compatible Codex execution and Volcengine Ark model access. It is designed to demonstrate a lightweight control plane for AI coding agents without introducing full enterprise security or multi-tenant isolation features.
+The system is built around OpenAI-compatible Codex execution and OpenRouter model access. It is designed to demonstrate a lightweight control plane for AI coding agents without introducing full enterprise security or multi-tenant isolation features.
 
 ## 2. Product scope
 
@@ -32,7 +32,7 @@ The project follows a simple architecture:
 - Workspace manager
 - Runtime runner abstraction
 - Codex execution backend
-- Volcengine Ark model access
+- OpenRouter model access
 
 The user interacts with the UI, which calls the API. The API validates requests and delegates to `AgentService`, which manages persistence and agent lifecycle. `AgentService` interacts with a workspace manager and a runner abstraction, which actualizes Codex execution in either local-container or host-process mode.
 
@@ -164,9 +164,9 @@ This means the repo is appropriate for demos, labs, and hackathon-style work, no
 
 The app loads environment configuration from process env values. Important variables include:
 
-- `ARK_API_KEY`: model access key
-- `ARK_MODEL`: model or endpoint id
-- `ARK_BASE_URL`: Ark API base URL
+- `OPENROUTER_API_KEY`: model access key
+- `OPENROUTER_MODEL`: full OpenRouter model slug (e.g. `openai/gpt-4o-mini`)
+- `OPENROUTER_BASE_URL`: OpenRouter API base URL
 - `APP_AUTH_TOKEN`: shared bearer token for demo access
 - `RUNTIME_PROVIDER`: local-process or container runtime selection
 - `CODEX_SANDBOX_MODE`: sandbox policy for Codex
@@ -175,7 +175,7 @@ The app loads environment configuration from process env values. Important varia
 - `CODEX_HOME`: Codex home/session directory
 - `CONTAINER_ENGINE`: Docker/Podman/Colima selection
 
-The app validates these values on startup and refuses to use Ark if configuration is incomplete.
+The app validates these values on startup and refuses to use OpenRouter if configuration is incomplete.
 
 ## 9. Notable implementation patterns
 

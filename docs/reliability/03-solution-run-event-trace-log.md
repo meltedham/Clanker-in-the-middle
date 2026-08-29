@@ -34,7 +34,7 @@ writeup and updated diagram.
 - `apps/server/src/middleware/trace-store.ts` (new; originally `trace.ts`,
   relocated) — `RunEvent`, `RunEventType`, `TraceWriter` (per-run NDJSON
   files under `<dataDirectory>/traces/`, append-only, redacts
-  `ARK_API_KEY=...` / `Bearer ...` / `sk-...`-shaped strings before they
+  `OPENROUTER_API_KEY=...` / `Bearer ...` / `sk-...`-shaped strings before they
   ever touch disk), `redact()`, `truncate()`, and a new `TraceReader`
   interface (`{ read(runId): Promise<RunEvent[]> }`) so read-only consumers
   (the API layer) don't depend on the concrete writer.
@@ -226,7 +226,7 @@ this keeps the minimal-UI requirement easy to satisfy (a flat list of
 import { appendFile, readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 
-const SECRET_PATTERN = /(sk-|ARK_API_KEY|Bearer\s+)[A-Za-z0-9._-]{8,}/g;
+const SECRET_PATTERN = /(sk-|OPENROUTER_API_KEY|Bearer\s+)[A-Za-z0-9._-]{8,}/g;
 
 function redact(value: string): string {
   return value.replace(SECRET_PATTERN, "[redacted]");
@@ -362,7 +362,7 @@ it produces" steps in the brief's required live demo (`bff.pdf` §8).
 - `trace.test.ts`:
   - `append` then `read` returns events in the order written, with
     increasing `seq`.
-  - `redact` scrubs an `ARK_API_KEY`/`Bearer ...`-shaped string from both
+  - `redact` scrubs an `OPENROUTER_API_KEY`/`Bearer ...`-shaped string from both
     `summary` and `detail` before it is written to disk (read the raw file
     contents in the test, not just the parsed return value, to prove it
     never touches disk unredacted).
@@ -382,7 +382,7 @@ it produces" steps in the brief's required live demo (`bff.pdf` §8).
   as a known limitation rather than implemented.
 - Redaction is a heuristic regex, not a guarantee against every possible
   secret shape. Treat it as a second line of defense, not the only one — the
-  primary defense is still that `ARK_API_KEY` is never placed in Codex's
+  primary defense is still that `OPENROUTER_API_KEY` is never placed in Codex's
   stdout/stderr in the first place (`childEnvironment()` in both runners
   only forwards it to the Codex process's own env, not to anything that
   gets echoed back).

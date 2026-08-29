@@ -6,7 +6,7 @@ cd "$repo_dir"
 
 env_file="${1:-.env.production}"
 if [[ ! -f "$env_file" ]]; then
-  echo "Missing $env_file. Copy .env.example and fill ARK_API_KEY / ARK_MODEL." >&2
+  echo "Missing $env_file. Copy .env.example and fill OPENROUTER_API_KEY / OPENROUTER_MODEL." >&2
   exit 1
 fi
 

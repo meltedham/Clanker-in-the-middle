@@ -8,7 +8,7 @@ Rebuilding the UI, control plane, local Runtime, or ECS setup is out of scope.
 - Browser Agent CRUD and Playground
 - Persistent workspaces and Codex sessions
 - One-line Docker, Colima, or Podman local Runtime
-- Volcengine Ark model connection
+- OpenRouter model connection
 - Optional Volcengine ECS deployment
 
 Local execution is the default judging path. Cloud deployment is optional.

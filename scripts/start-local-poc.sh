@@ -63,9 +63,9 @@ detect_engine() {
   return 1
 }
 
-if [[ -z "${ARK_API_KEY:-}" || -z "${ARK_MODEL:-}" ]]; then
-  log "ARK_API_KEY and ARK_MODEL are required."
-  log "Example: ARK_API_KEY=key ARK_MODEL=ep-id ./scripts/start-local-poc.sh"
+if [[ -z "${OPENROUTER_API_KEY:-}" || -z "${OPENROUTER_MODEL:-}" ]]; then
+  log "OPENROUTER_API_KEY and OPENROUTER_MODEL are required."
+  log "Example: OPENROUTER_API_KEY=key OPENROUTER_MODEL=openai/gpt-4o-mini ./scripts/start-local-poc.sh"
   exit 2
 fi
 

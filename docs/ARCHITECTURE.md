@@ -17,8 +17,8 @@ flowchart LR
     Middleware --> InnerRunner{"CodexRunner /\nContainerCodexRunner"}
     InnerRunner -->|Local POC| Container["Disposable Runtime container"]
     InnerRunner -->|ECS| Process["Codex child process"]
-    Container --> Ark["Volcengine Ark"]
-    Process --> Ark
+    Container --> OpenRouter["OpenRouter"]
+    Process --> OpenRouter
 ```
 
 ## Components
@@ -26,7 +26,7 @@ flowchart LR
 ### Web UI
 
 Lists Agents, manages lifecycle actions, submits prompts, and polls asynchronous
-Runs. It never receives the Ark API key.
+Runs. It never receives the OpenRouter API key.
 
 ### Fastify API
 
