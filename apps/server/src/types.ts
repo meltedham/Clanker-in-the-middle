@@ -1,3 +1,14 @@
+import type { RagSummary } from "./rag/types.js";
+
+export type {
+  RagStatus,
+  RagSummary,
+  RagSourceType,
+  RagMatch,
+  RagContext,
+  EmbeddingClient,
+} from "./rag/types.js";
+
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
@@ -41,21 +52,7 @@ export interface AgentRun {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
-}
-
-export type RagSourceType = "workspace" | "shared" | "message";
-
-export interface RagMatch {
-  sourceType: RagSourceType;
-  sourceId: string;
-  title: string;
-  content: string;
-  score: number;
-}
-
-export interface RagContext {
-  prompt: string;
-  matches: RagMatch[];
+  retrieval: RagSummary | null;
 }
 
 export interface Database {
@@ -88,10 +85,6 @@ export interface RunnerRequest {
   workspacePath: string;
   prompt: string;
   threadId: string | null;
-}
-
-export interface EmbeddingClient {
-  embed(texts: string[]): Promise<number[][]>;
 }
 
 export interface AgentRunner {

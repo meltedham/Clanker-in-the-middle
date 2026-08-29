@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isModelConfigured, isOpenRouterConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
-import { RagService } from "./rag-service.js";
+import { RagService } from "./rag/rag-service.js";
+import { normalizeUploadContent, type UploadInput } from "./rag/upload-content.js";
 import { JsonStore } from "./store.js";
 import { SharedResourceManager } from "./shared-resource-manager.js";
 import type {
@@ -11,6 +12,8 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  RagContext,
+  RagSummary,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -129,10 +132,10 @@ export class AgentService {
   }
 
   async uploadSharedResource(
-    name: string,
-    content: string,
+    input: UploadInput,
   ): Promise<{ name: string; size: number; updatedAt: string }> {
-    return this.sharedResources.write(name, content);
+    const content = (await normalizeUploadContent(input)).trim();
+    return this.sharedResources.write(input.name, content);
   }
 
   async deleteSharedResource(name: string): Promise<void> {
@@ -146,11 +149,11 @@ export class AgentService {
 
   async uploadAgentResource(
     agentId: string,
-    name: string,
-    content: string,
+    input: UploadInput,
   ): Promise<{ name: string; size: number; updatedAt: string }> {
     this.getAgent(agentId);
-    return this.workspaces.writeUpload(agentId, name, content);
+    const content = (await normalizeUploadContent(input)).trim();
+    return this.workspaces.writeUpload(agentId, input.name, content);
   }
 
   async deleteAgentUpload(agentId: string, name: string): Promise<void> {
@@ -195,7 +198,7 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
-  ): Promise<{ run: AgentRun; message: Message }> {
+  ): Promise<{ run: AgentRun; message: Message; retrieval: RagSummary }> {
     if (!isModelConfigured(this.config)) {
       throw new HttpError(
         503,
@@ -215,6 +218,7 @@ export class AgentService {
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
+      retrieval: null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -243,7 +247,24 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
-    const execution = this.executeRun(agentAtStart, run);
+    let ragContext: RagContext;
+    try {
+      ragContext = await this.ragService.buildContext(agentAtStart, prompt, runId);
+    } catch {
+      ragContext = {
+        prompt,
+        matches: [],
+        summary: emptyRetrievalSummary(),
+      };
+    }
+    run.retrieval = ragContext.summary;
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      if (storedRun) {
+        storedRun.retrieval = ragContext.summary;
+      }
+    });
+    const execution = this.executeRun(agentAtStart, run, ragContext);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -252,7 +273,7 @@ export class AgentService {
         }
       })
       .catch(() => undefined);
-    return { run, message };
+    return { run, message, retrieval: ragContext.summary };
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {
@@ -277,7 +298,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    ragContext: Pick<RagContext, "prompt" | "summary">,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -289,7 +314,6 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      const ragContext = await this.ragService.buildContext(agentAtStart, run.prompt, run.id);
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
@@ -369,4 +393,14 @@ export class AgentService {
       this.cancellationRequests.delete(agentId);
     }
   }
+}
+
+function emptyRetrievalSummary(): RagSummary {
+  return {
+    status: "no_context",
+    confidence: 0,
+    topScore: null,
+    candidateCount: 0,
+    matchCount: 0,
+  };
 }

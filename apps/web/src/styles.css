@@ -693,6 +693,79 @@ textarea:focus {
   gap: 6px;
 }
 
+.playground-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.retrieval-badge {
+  min-width: 150px;
+  border-radius: 12px;
+  border: 1px solid #dfddd4;
+  padding: 8px 10px;
+  background: #fffdf9;
+  display: grid;
+  gap: 2px;
+  text-align: right;
+}
+
+.retrieval-badge span,
+.retrieval-badge small,
+.retrieval-badge strong {
+  display: block;
+}
+
+.retrieval-badge span,
+.retrieval-badge small {
+  color: #777870;
+  font-size: 9px;
+}
+
+.retrieval-badge strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.retrieval-weak {
+  border-color: #eed0cb;
+  background: #fff5f2;
+}
+
+.retrieval-moderate {
+  border-color: #e2d6fb;
+  background: #faf6ff;
+}
+
+.retrieval-strong {
+  border-color: #cfe7d8;
+  background: #f1fbf4;
+}
+
+.file-chip {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid #ddd9ce;
+  border-radius: 11px;
+  background: #fffdf9;
+}
+
+.file-chip strong,
+.file-chip span {
+  display: block;
+}
+
+.file-chip strong {
+  font-size: 12px;
+}
+
+.file-chip span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .pulse {
   width: 6px;
   height: 6px;

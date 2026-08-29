@@ -32,8 +32,15 @@ const messageBody = z.object({
 });
 const uploadBody = z.object({
   name: z.string().trim().min(1).max(200).regex(/^[^/\\]+$/),
-  content: z.string().max(1_000_000),
-});
+  content: z.string().max(2_000_000).optional(),
+  contentBase64: z.string().max(4_000_000).optional(),
+  mimeType: z.string().max(200).optional(),
+}).refine(
+  (body) => Boolean(body.content?.length ?? 0) || Boolean(body.contentBase64?.length ?? 0),
+  {
+    message: "Either content or contentBase64 is required",
+  },
+);
 
 export async function createApp(
   config: AppConfig,
@@ -44,7 +51,7 @@ export async function createApp(
       level: config.logLevel,
       redact: ["req.headers.authorization", "req.headers.cookie"],
     },
-    bodyLimit: 1_048_576,
+    bodyLimit: 8_388_608,
   });
 
   await app.register(cors, {
@@ -137,7 +144,7 @@ export async function createApp(
     const { id } = agentIdParams.parse(request.params);
     const body = uploadBody.parse(request.body);
     return reply.code(201).send({
-      upload: await service.uploadAgentResource(id, body.name, body.content),
+      upload: await service.uploadAgentResource(id, body),
     });
   });
 
@@ -162,7 +169,7 @@ export async function createApp(
   app.post("/api/shared-resources", async (request, reply) => {
     const body = uploadBody.parse(request.body);
     return reply.code(201).send({
-      resource: await service.uploadSharedResource(body.name, body.content),
+      resource: await service.uploadSharedResource(body),
     });
   });
 

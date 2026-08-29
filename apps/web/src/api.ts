@@ -71,7 +71,15 @@ export const api = {
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
   uploads: (id: string) =>
     request<{ uploads: ResourceSummary[] }>("/api/agents/" + id + "/uploads"),
-  uploadAgentResource: (id: string, body: { name: string; content: string }) =>
+  uploadAgentResource: (
+    id: string,
+    body: {
+      name: string;
+      content?: string;
+      contentBase64?: string;
+      mimeType?: string;
+    },
+  ) =>
     request<{ upload: ResourceSummary }>("/api/agents/" + id + "/uploads", {
       method: "POST",
       body: JSON.stringify(body),
@@ -82,7 +90,14 @@ export const api = {
     }),
   sharedResources: () =>
     request<{ resources: ResourceSummary[] }>("/api/shared-resources"),
-  createSharedResource: (body: { name: string; content: string }) =>
+  createSharedResource: (
+    body: {
+      name: string;
+      content?: string;
+      contentBase64?: string;
+      mimeType?: string;
+    },
+  ) =>
     request<{ resource: ResourceSummary }>("/api/shared-resources", {
       method: "POST",
       body: JSON.stringify(body),
@@ -92,7 +107,7 @@ export const api = {
       method: "DELETE",
     }),
   sendMessage: (id: string, content: string) =>
-    request<{ run: AgentRun; message: Message }>(
+    request<{ run: AgentRun; message: Message; retrieval: AgentRun["retrieval"] }>(
       "/api/agents/" + id + "/messages",
       {
         method: "POST",

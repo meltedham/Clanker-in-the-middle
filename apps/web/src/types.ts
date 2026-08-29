@@ -36,6 +36,13 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  retrieval: {
+    status: "no_context" | "weak" | "moderate" | "strong";
+    confidence: number;
+    topScore: number | null;
+    candidateCount: number;
+    matchCount: number;
+  } | null;
 }
 
 export interface ResourceSummary {

@@ -23,6 +23,13 @@ export class JsonStore {
       if (parsed.version !== 1 || !Array.isArray(parsed.agents)) {
         throw new Error("Unsupported database format");
       }
+      parsed.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+      parsed.runs = Array.isArray(parsed.runs) ? parsed.runs : [];
+      for (const run of parsed.runs) {
+        if (typeof (run as { retrieval?: unknown }).retrieval === "undefined") {
+          (run as { retrieval: null }).retrieval = null;
+        }
+      }
       this.data = parsed;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {

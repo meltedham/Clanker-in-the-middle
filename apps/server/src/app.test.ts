@@ -7,19 +7,58 @@ const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
   listUploads: async () => [],
-  uploadAgentResource: async (_agentId: string, name: string, content: string) => ({
-    name,
-    size: content.length,
+  uploadAgentResource: async (
+    _agentId: string,
+    body: { name: string; content?: string; contentBase64?: string },
+  ) => ({
+    name: body.name,
+    size: (body.content ?? body.contentBase64 ?? "").length,
     updatedAt: new Date().toISOString(),
   }),
   deleteAgentUpload: async () => undefined,
   listSharedResources: async () => [],
-  uploadSharedResource: async (name: string, content: string) => ({
-    name,
-    size: content.length,
+  uploadSharedResource: async (body: { name: string; content?: string; contentBase64?: string }) => ({
+    name: body.name,
+    size: (body.content ?? body.contentBase64 ?? "").length,
     updatedAt: new Date().toISOString(),
   }),
   deleteSharedResource: async () => undefined,
+  sendMessage: async () => ({
+    run: {
+      id: "run",
+      agentId: "123e4567-e89b-12d3-a456-426614174000",
+      status: "queued",
+      prompt: "hello",
+      output: null,
+      error: null,
+      usage: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: new Date().toISOString(),
+      retrieval: {
+        status: "moderate",
+        confidence: 0.6,
+        topScore: 0.6,
+        candidateCount: 2,
+        matchCount: 1,
+      },
+    },
+    message: {
+      id: "message",
+      agentId: "123e4567-e89b-12d3-a456-426614174000",
+      runId: "run",
+      role: "user",
+      content: "hello",
+      createdAt: new Date().toISOString(),
+    },
+    retrieval: {
+      status: "moderate",
+      confidence: 0.6,
+      topScore: 0.6,
+      candidateCount: 2,
+      matchCount: 1,
+    },
+  }),
 } as unknown as AgentService;
 
 describe("HTTP boundary", () => {
@@ -54,7 +93,7 @@ describe("HTTP boundary", () => {
       method: "POST",
       url: "/api/agents",
       headers: { "content-type": "application/json" },
-      payload: JSON.stringify({ name: "x".repeat(1_100_000) }),
+      payload: JSON.stringify({ name: "x".repeat(9_000_000) }),
     });
     expect(oversized.statusCode).toBe(413);
     await app.close();
@@ -82,6 +121,23 @@ describe("HTTP boundary", () => {
     });
     expect(agentUpload.statusCode).toBe(201);
 
+    await app.close();
+  });
+
+  it("returns retrieval summary with message sends", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), service);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agents/123e4567-e89b-12d3-a456-426614174000/messages",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ content: "hello" }),
+    });
+    expect(response.statusCode).toBe(202);
+    const payload = response.json() as {
+      retrieval?: { status: string; confidence: number };
+    };
+    expect(payload.retrieval?.status).toBe("moderate");
+    expect(payload.retrieval?.confidence).toBeCloseTo(0.6);
     await app.close();
   });
 });

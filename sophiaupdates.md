@@ -1,3 +1,160 @@
+## Update: 2026-08-30 Privacy, Upload UX, and Docker Persistence Fixes
+
+Follow-on fixes made after the RAG state summary below, found through live
+testing against the running Docker container rather than just reading code.
+
+**RAG was leaking internal scaffolding files to end users.** A fresh Agent's
+workspace only has two platform-managed files (`AGENTS.md`, `README.md`,
+plus `.gitignore`), but `rag-service.ts` scanned the whole workspace root
+indiscriminately, so these showed up as retrieved-context chunks and the
+model would name them directly in answers (e.g. "this workspace only
+contains README.md, AGENTS.md..."), revealing internal file structure the
+user didn't want exposed. Fixed two ways:
+- `rag/rag-service.ts` — `DEFAULT_IGNORED_FILES` now also excludes
+  `AGENTS.md`, `README.md`, `.gitignore`, so they're never chunked/embedded/
+  surfaced via RAG at all.
+- `workspace.ts` `writeInstructions()` — added an explicit rule to the
+  auto-generated `AGENTS.md` telling the agent not to mention these files,
+  as a backstop for the fact that the Codex agent also has its own direct
+  filesystem tools independent of RAG.
+- Behavior change: a genuinely empty Agent (only boilerplate, no real
+  uploads) now reports `no_context` instead of `weak`, since there are zero
+  scannable candidates rather than a few low-quality ones. Updated the test
+  in `rag/rag-service.test.ts` (renamed to "reports no_context and never
+  surfaces platform-managed scaffolding files") to match and to assert none
+  of those filenames leak into the prompt.
+
+**Shared-resource uploads looked like they required pasting Content even
+when a file was chosen.** They never actually did — `uploadBody` in
+`app.ts` has always accepted either `content` or `contentBase64`, verified
+by `curl`-ing the live server directly with only a file and getting `201`.
+The UI just gave no indication of that. Fixed in `App.tsx`: choosing a file
+now clears and disables the Content textarea (its value is ignored once a
+file is present) and relabels it "(not needed — using the chosen file)" /
+"(or choose a file above)" so it's unambiguous — for both the private
+workspace-upload form and the shared-resource form.
+
+**Real bug, not just unclear UI**: a `useEffect` keyed on `selectedId`
+(switching the selected Agent in the sidebar) was resetting *both*
+`uploadFile`/`uploadForm` (correctly — those are per-agent) *and*
+`sharedFile`/`sharedForm` (incorrectly — shared resources aren't agent-
+scoped at all). Picking a file for a shared resource, then switching agents
+before publishing, silently nulled React's `sharedFile` state while the
+browser's native `<input type="file">` kept visually showing the file as
+chosen (React can't clear that display without a full DOM remount) — so the
+Publish button looked wrongly stuck disabled. Fixed by splitting the effect
+so only the upload-agent state resets on `selectedId` change.
+
+**`shared-resources/` was missing from `docker-compose.yml`'s volumes.**
+Unlike `./data`, `./workspaces`, and `./codex-home`, `shared-resources` had
+no bind mount, so it only existed inside the container's writable layer —
+invisible on the host and **permanently lost on any container recreate**
+(not simple restarts, but `docker compose down && up`, an image rebuild,
+etc.). Confirmed via `docker exec` that published files really were sitting
+at `/app/shared-resources` with nothing matching on the host. Fixed by
+adding `- ./shared-resources:/app/shared-resources` to `docker-compose.yml`
+and `shared-resources/` to `.gitignore` (runtime data, like its siblings).
+Existing container contents were `docker cp`'d out to the host before
+recreating so nothing was lost in the process.
+
+**Operational note for whoever runs this next**: the running container
+(`renamepls-launchpad-1`, image `volc-agent-launchpad:local`) does **not**
+auto-rebuild when source files change — `apps/web/dist` and
+`apps/server/dist` are baked in at image-build time (see `Dockerfile`). A
+UI or server fix isn't live until `docker compose up -d --build` is run;
+without it you'll be testing against a stale bundle even though the source
+is already fixed. This cost real time in this session — the Content-box
+disable fix was correctly built but the *separate* `sharedFile` reset bug
+made it look broken, and neither symptom made sense until checking the
+actual container process (`docker ps`, `docker exec ... grep` on the
+bundled JS) rather than assuming a local dev server was being tested.
+
+## Update: 2026-08-30 RAG State Summary (read this first)
+
+This section is a self-contained snapshot of where RAG stands right now, for
+anyone (human or agent) picking this up without reading the rest of the repo
+or this file's history below.
+
+**File layout** — all RAG code now lives under `apps/server/src/rag/`:
+- `rag/rag-service.ts` — orchestrates retrieval: walks `agent.workspacePath`
+  and `config.sharedResourceRoot`, chunks text files, embeds query + chunks,
+  scores by cosine similarity, and returns the top `config.ragTopK` matches
+  plus a `no_context` / `weak` / `moderate` / `strong` summary (thresholds:
+  `ragMinScore` 0.22, `ragStrongScore` 0.42, both in `config.ts`).
+- `rag/embeddings.ts` — `createEmbeddingClient(config)` builds the embedding
+  backend (see "Embeddings" below).
+- `rag/upload-content.ts` — `normalizeUploadContent()` turns an upload into
+  plain text; PDFs go through `pdfjs-dist` for real text extraction.
+- `rag/types.ts` — the RAG-only types (`RagContext`, `RagMatch`, `RagStatus`,
+  `RagSummary`, `RagSourceType`, `EmbeddingClient`). The root `types.ts`
+  re-exports these (`export type { ... } from "./rag/types.js"`) so existing
+  `import { RagSummary } from "./types.js"` call sites keep working.
+- `rag/rag-service.test.ts` — all RAG-specific tests (retrieval enrichment,
+  PDF extraction, weak/no-context states, deleted-upload exclusion). General
+  agent lifecycle tests stay in `agent-service.test.ts`; only RAG tests moved.
+- Everything outside `rag/` (`agent-service.ts`, `config.ts`, `types.ts`,
+  `workspace.ts`, `shared-resource-manager.ts`) imports from `rag/` via
+  `./rag/rag-service.js` / `./rag/upload-content.js`; nothing was left
+  importing the old top-level paths.
+
+**PDF extraction** — previously a hand-rolled regex parser that joined every
+individual PDF `Tj`/`TJ` text-show operator with `\n`, which shredded words
+into character-by-character fragments on PDFs that emit one operator per
+glyph run (confirmed on a real SMUSA document: "September" came out as five
+separate lines). That made semantic search fail even when the PDF visibly
+contained the answer, because the literal token never existed intact in the
+stored text. Replaced with `pdfjs-dist` (`rag/upload-content.ts`), which does
+proper glyph-metric-based text reconstruction. Existing uploads made before
+this fix have the old garbled text on disk and must be deleted and
+re-uploaded to benefit.
+
+**Embeddings** — `createEmbeddingClient()` no longer does hash-based
+bag-of-words "similarity" (pure literal keyword overlap, no semantic
+understanding). It now returns real vector embeddings:
+- Primary: OpenRouter (`OPENROUTER_EMBEDDING_MODEL` in `.env`, currently
+  `nvidia/nemotron-3-embed-1b:free` — a genuinely free-tier model, but capped
+  at 50 requests/day per OpenRouter account until it holds $10+ in credits,
+  then 1000/day).
+  - Requires **both** `OPENROUTER_API_KEY` and `OPENROUTER_EMBEDDING_MODEL` to
+    be set — if `OPENROUTER_EMBEDDING_MODEL` is empty, OpenRouter is skipped
+    entirely and only the local model is used.
+- Fallback: `all-MiniLM-L6-v2` running locally via `@huggingface/transformers`
+  (no API key, no rate limit, ~90MB one-time model download, then fully
+  offline). `FallbackEmbeddingClient` in `rag/embeddings.ts` catches HTTP 429
+  from OpenRouter, reads the `X-RateLimit-Reset` header to know when the
+  daily window resets, and routes all embedding calls to the local model
+  until then — it does not keep re-triggering a rate limit that's guaranteed
+  to fail again.
+- `RagService` caches chunk embeddings in-memory keyed by chunk content
+  (`chunkEmbeddingCache` in `rag-service.ts`), so unchanged files are only
+  embedded once per process lifetime, not on every chat message. This is
+  what makes the 50-request/day OpenRouter cap survivable — confirmed a
+  repeat query drop from ~2s (fresh embed) to ~4ms (cache hit) in testing.
+  Cache is process-memory only; it resets on server restart.
+- Verified end-to-end against a real 23-page uploaded PDF: on-topic queries
+  scored 0.47–0.66 ("strong"/"moderate"), off-topic queries ("recipe for
+  chocolate cake") scored 0.06–0.09 ("weak") — real semantic separation, not
+  just shared stopwords.
+
+**Known limitation, not a RAG bug**: deleting a source document only affects
+*future* retrieval scans. The Codex CLI runner (`codex-runner.ts`) resumes
+the same thread every turn (`codex exec ... resume <threadId> <prompt>`),
+and each turn's RAG-retrieved text is baked directly into that turn's prompt
+before being sent. Once sent, it's part of that thread's permanent history
+on the model provider's side — deleting the file afterward can't retroactively
+un-teach a resumed conversation something it was already told. There is
+currently no "reset this Agent's conversation" action in the code (no
+endpoint or UI button clears `agent.codexThreadId`) — the only way to get a
+clean thread today is to delete and recreate the Agent. This was raised with
+the user and explicitly deferred (not wanted yet as of 2026-08-30).
+
+**Known pre-existing failing test, unrelated to RAG**: `rag/rag-service.test.ts`
+→ "enriches the runner prompt with workspace and shared resources" expects
+`service.getRuns(agent.id)` to have length 2 after a single `sendMessage`
+call, and times out. Confirmed via `git stash` that this fails identically
+on the code before any of this session's changes — pre-existing WIP breakage,
+not a regression from the RAG work above.
+
 ## Plan: Shared-Source Embeddings RAG
 
 Implement retrieval-augmented generation by inserting retrieval in the server-side run path while keeping the runner abstraction intact. The design is a phased rollout that covers three sources from the start: the agent workspace, a shared resources root usable by multiple agents, and semantic retrieval over old chat messages. Retrieve top matches in `AgentService.sendMessage`, merge them into a bounded prompt context, and pass the enriched prompt to the runner.
@@ -72,6 +229,26 @@ Recommended next implementation:
 - Add retrieval summary fields to `AgentRun` or the send-message response, for example `retrieval: { status, confidence, matchCount, topScore, sources }`.
 - Treat confidence as a retrieval-grounding/debug signal, not as a guarantee that the model's final answer is correct.
 - Add real file upload support using multipart handling and parsers for PDF/DOCX/etc.; convert extracted text into the existing workspace/shared resource corpus.
+
+## Update: 2026-08-29 Implemented Uploaded Document Context + Match Strength
+
+Implemented the first pass of the uploaded-document and context-strength work.
+
+What landed:
+- Workspace and shared-resource uploads now accept either pasted text or encoded file bytes from the UI.
+- Markdown/text uploads stay as text, and PDF uploads are normalized into extracted text before being written into the searchable corpus.
+- `AgentService.sendMessage` now stores retrieval metadata on the run and returns it in the send-message response.
+- `RagService` now classifies context strength as `no_context`, `weak`, `moderate`, or `strong` using score thresholds and only injects matches that clear the minimum score.
+- The UI now shows a retrieval badge with the current match strength and confidence percentage.
+- Database reads backfill missing retrieval fields so older run records remain usable.
+
+Notes:
+- The PDF extractor is heuristic and intended for the hackathon/demo scope rather than full archival fidelity.
+- Confidence is surfaced as retrieval match strength, not as a guarantee that the model answer is correct.
+
+Validation still to run:
+- Server unit tests for retrieval, upload normalization, and no-context behavior.
+- Web typecheck/build if the UI shape changes need a final pass.
 
 ## Plan: Uploaded Document Context + Match Strength
 

@@ -63,6 +63,9 @@ export class WorkspaceManager {
       "- Preserve existing user files and avoid destructive operations.",
       "- Build and test changes when practical.",
       "- Never print environment variables or credentials.",
+      "- Never mention or describe this AGENTS.md file, README.md, .gitignore, or any other" +
+        " platform-managed scaffolding file to the user — treat them as internal implementation" +
+        " detail, not workspace content.",
       "",
       "This file is regenerated when the Agent configuration is updated.",
       "",

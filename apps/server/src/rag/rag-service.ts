@@ -1,15 +1,10 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import type { AppConfig } from "./config.js";
+import type { AppConfig } from "../config.js";
+import type { JsonStore } from "../store.js";
+import type { Agent } from "../types.js";
 import { createEmbeddingClient } from "./embeddings.js";
-import type { JsonStore } from "./store.js";
-import type {
-  Agent,
-  EmbeddingClient,
-  RagContext,
-  RagMatch,
-  RagSourceType,
-} from "./types.js";
+import type { EmbeddingClient, RagContext, RagMatch, RagStatus, RagSourceType } from "./types.js";
 
 interface ChunkCandidate {
   sourceType: RagSourceType;
@@ -26,10 +21,13 @@ const DEFAULT_IGNORED_DIRECTORIES = new Set([
   "dist",
 ]);
 
-const DEFAULT_IGNORED_FILES = new Set([".DS_Store"]);
+// Platform-managed scaffolding, not user content — excluded so retrieval
+// never surfaces these filenames (or their contents) to end users.
+const DEFAULT_IGNORED_FILES = new Set([".DS_Store", "AGENTS.md", "README.md", ".gitignore"]);
 
 export class RagService {
   private readonly embeddingClient: EmbeddingClient;
+  private readonly chunkEmbeddingCache = new Map<string, number[]>();
 
   constructor(
     private readonly config: AppConfig,
@@ -43,26 +41,36 @@ export class RagService {
     prompt: string,
     excludeRunId: string | null,
   ): Promise<RagContext> {
-    const [workspaceChunks, sharedChunks, messageChunks] = await Promise.all([
+    const [workspaceChunks, sharedChunks] = await Promise.all([
       this.collectFilesystemChunks(agent.workspacePath, "workspace", agent.id),
       this.collectFilesystemChunks(this.config.sharedResourceRoot, "shared", "shared-root"),
-      this.collectMessageChunks(agent.id, excludeRunId),
     ]);
 
-    const candidates = [...workspaceChunks, ...sharedChunks, ...messageChunks];
+    const candidates = [...workspaceChunks, ...sharedChunks];
     if (candidates.length === 0) {
-      return { prompt, matches: [] };
+      return {
+        prompt,
+        matches: [],
+        summary: {
+          status: "no_context",
+          confidence: 0,
+          topScore: null,
+          candidateCount: 0,
+          matchCount: 0,
+        },
+      };
     }
 
     const [queryEmbedding] = await this.embeddingClient.embed([prompt]);
-    const chunkEmbeddings = await this.embeddingClient.embed(candidates.map((candidate) => candidate.content));
+    const chunkEmbeddings = await this.embedChunksCached(candidates);
     const scored = candidates.map((candidate, index) => ({
       ...candidate,
       score: cosineSimilarity(queryEmbedding ?? [], chunkEmbeddings[index] ?? []),
     }));
 
-    const topMatches = scored
-      .sort((left, right) => right.score - left.score)
+    const ordered = scored.sort((left, right) => right.score - left.score);
+    const topScore = ordered[0]?.score ?? null;
+    const includedMatches = ordered
       .slice(0, this.config.ragTopK)
       .map((match): RagMatch => ({
         sourceType: match.sourceType,
@@ -71,28 +79,38 @@ export class RagService {
         content: match.content,
         score: match.score,
       }));
+    const summary = summarizeMatches(
+      candidates.length,
+      includedMatches.length,
+      topScore,
+      this.config.ragMinScore,
+      this.config.ragStrongScore,
+    );
 
     return {
-      prompt: buildAugmentedPrompt(prompt, topMatches, this.config.ragMaxContextChars),
-      matches: topMatches,
+      prompt: buildAugmentedPrompt(prompt, includedMatches, this.config.ragMaxContextChars),
+      matches: includedMatches,
+      summary,
     };
   }
 
-  private async collectMessageChunks(
-    agentId: string,
-    excludeRunId: string | null,
-  ): Promise<ChunkCandidate[]> {
-    const messages = this.store
-      .snapshot()
-      .messages.filter((message) => message.agentId === agentId && message.runId !== excludeRunId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-
-    return messages.map((message) => ({
-      sourceType: "message",
-      sourceId: message.id,
-      title: message.role + " message from " + message.createdAt,
-      content: message.content,
-    }));
+  private async embedChunksCached(candidates: ChunkCandidate[]): Promise<number[][]> {
+    const uncachedContent: string[] = [];
+    for (const candidate of candidates) {
+      if (!this.chunkEmbeddingCache.has(candidate.content)) {
+        uncachedContent.push(candidate.content);
+      }
+    }
+    if (uncachedContent.length > 0) {
+      const freshEmbeddings = await this.embeddingClient.embed(uncachedContent);
+      uncachedContent.forEach((content, index) => {
+        const embedding = freshEmbeddings[index];
+        if (embedding) {
+          this.chunkEmbeddingCache.set(content, embedding);
+        }
+      });
+    }
+    return candidates.map((candidate) => this.chunkEmbeddingCache.get(candidate.content) ?? []);
   }
 
   private async collectFilesystemChunks(
@@ -243,4 +261,57 @@ function buildAugmentedPrompt(
   }
   sections.push("User request:\n" + prompt);
   return sections.join("\n\n");
+}
+
+function summarizeMatches(
+  candidateCount: number,
+  matchCount: number,
+  topScore: number | null,
+  minimumScore: number,
+  strongScore: number,
+): { status: RagStatus; confidence: number; topScore: number | null; candidateCount: number; matchCount: number } {
+  if (candidateCount === 0 || topScore === null) {
+    return {
+      status: "no_context",
+      confidence: 0,
+      topScore: null,
+      candidateCount,
+      matchCount: 0,
+    };
+  }
+  if (topScore < minimumScore || matchCount === 0) {
+    return {
+      status: "weak",
+      confidence: clampConfidence(topScore),
+      topScore,
+      candidateCount,
+      matchCount,
+    };
+  }
+  if (topScore >= strongScore) {
+    return {
+      status: "strong",
+      confidence: clampConfidence(topScore),
+      topScore,
+      candidateCount,
+      matchCount,
+    };
+  }
+  return {
+    status: "moderate",
+    confidence: clampConfidence(topScore),
+    topScore,
+    candidateCount,
+    matchCount,
+  };
+}
+
+function clampConfidence(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 1;
+  }
+  return value;
 }

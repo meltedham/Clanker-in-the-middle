@@ -112,6 +112,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     ragChunkSize: 1_200,
     ragScanLimit: 200,
     ragMaxContextChars: 12_000,
+    ragMinScore: 0.22,
+    ragStrongScore: 0.42,
   };
 }
 
