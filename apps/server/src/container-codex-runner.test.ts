@@ -24,6 +24,8 @@ describe("Container Codex runner", () => {
         workspacePath: "/tmp/agent-workspace",
         prompt: "write a small program",
         threadId: null,
+        sandboxMode: "workspace-write",
+        networkAccess: true,
       },
       config,
     );
@@ -36,10 +38,53 @@ describe("Container Codex runner", () => {
     expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
     expect(args).toContain("501:20");
     expect(args).toContain("workspace-write");
+    expect(args).toContain("bridge");
     expect(args).toContain("/workspace");
     expect(args).toContain("io.codejam.instance-id=test-instance");
     expect(args).toContain("keep-id");
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
+  });
+
+  it("cuts network access per-Agent when networkAccess is false", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      CODEX_HOME: "/tmp/codex-home",
+      RUNTIME_PROVIDER: "container",
+    });
+    const args = buildContainerRunArgs(
+      {
+        agentId: "agent",
+        workspacePath: "/tmp/workspace",
+        prompt: "install a dependency",
+        threadId: null,
+        sandboxMode: "workspace-write",
+        networkAccess: false,
+      },
+      config,
+    );
+    expect(args).toContain("none");
+    expect(args).not.toContain("bridge");
+  });
+
+  it("blocks writes per-Agent via read-only sandbox mode", () => {
+    const config = loadConfig({
+      NODE_ENV: "test",
+      CODEX_HOME: "/tmp/codex-home",
+      RUNTIME_PROVIDER: "container",
+    });
+    const args = buildContainerRunArgs(
+      {
+        agentId: "agent",
+        workspacePath: "/tmp/workspace",
+        prompt: "just look around",
+        threadId: null,
+        sandboxMode: "read-only",
+        networkAccess: true,
+      },
+      config,
+    );
+    expect(args).toContain("read-only");
+    expect(args).not.toContain("workspace-write");
   });
 
   it("resumes a thread inside the mounted Runtime workspace", () => {
@@ -54,6 +99,8 @@ describe("Container Codex runner", () => {
         workspacePath: "/tmp/workspace",
         prompt: "continue",
         threadId: "thread-123",
+        sandboxMode: "workspace-write",
+        networkAccess: true,
       },
       config,
     );

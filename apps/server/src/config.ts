@@ -1,6 +1,16 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import type { UserRole } from "./types.js";
+
+/** A user seeded from the APP_USERS env var at boot. AgentService hashes
+ * `token` before it ever touches the persisted store. */
+export interface SeedUser {
+  id: string;
+  name: string;
+  token: string;
+  role: UserRole;
+}
 
 const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
@@ -11,7 +21,7 @@ const envSchema = z.object({
   CODEX_HOME: z.string().default(path.resolve("codex-home")),
   CODEX_BIN: z.string().default("codex"),
   CODEX_SANDBOX_MODE: z
-    .enum(["read-only", "workspace-write", "danger-full-access"])
+    .enum(["read-only", "workspace-write"])
     .default("workspace-write"),
   CODEX_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(600_000),
   CODEX_MAX_OUTPUT_BYTES: z.coerce.number().int().min(65_536).default(2_097_152),
@@ -38,6 +48,14 @@ const envSchema = z.object({
     .max(128)
     .regex(/^[A-Za-z0-9._~-]*$/, "APP_AUTH_TOKEN must use URL-safe characters")
     .optional(),
+  // Optional users seeded into the store at boot, for reproducible demo
+  // accounts. Format: "id:name:token,id:name:token[:role]", role is
+  // "member" (default) or "admin". Additional users can also be created at
+  // runtime via POST /api/users; identity/ownership enforcement activates
+  // the moment any user exists in the store, seeded or not. Leave unset and
+  // never call POST /api/users to keep the single-user baseline (or the
+  // legacy shared APP_AUTH_TOKEN) unchanged.
+  APP_USERS: z.string().trim().optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
   ARK_BASE_URL: z
@@ -47,11 +65,34 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 });
 
+function parseUsers(raw: string | undefined): SeedUser[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const [id, name, token, role] = entry.split(":").map((part) => part.trim());
+      if (!id || !name || !token) {
+        throw new Error(
+          `APP_USERS entry "${entry}" must be formatted as "id:name:token" or "id:name:token:role"`,
+        );
+      }
+      if (role !== undefined && role !== "member" && role !== "admin") {
+        throw new Error(
+          `APP_USERS entry "${entry}" has role "${role}" -- must be "member" or "admin"`,
+        );
+      }
+      return { id, name, token, role: role === "admin" ? "admin" : "member" };
+    });
+}
+
 export type AppConfig = ReturnType<typeof loadConfig>;
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
   const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
+  const users = parseUsers(env.APP_USERS);
   const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
   if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
     if (authToken.length < 24 || authToken.startsWith("replace-")) {
@@ -59,6 +100,20 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
         "APP_AUTH_TOKEN must contain at least 24 characters for a non-loopback production server",
       );
     }
+    for (const user of users) {
+      if (user.token.length < 16) {
+        throw new Error(
+          `APP_USERS token for "${user.id}" must contain at least 16 characters for a non-loopback production server`,
+        );
+      }
+    }
+  }
+  const duplicateIds = new Set<string>();
+  for (const user of users) {
+    if (duplicateIds.has(user.id)) {
+      throw new Error(`APP_USERS contains a duplicate id "${user.id}"`);
+    }
+    duplicateIds.add(user.id);
   }
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
@@ -84,6 +139,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
+    users,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),

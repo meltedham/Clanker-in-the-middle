@@ -7,13 +7,53 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
+import type { AuthUser } from "./types.js";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    authUser?: AuthUser;
+  }
+}
+
+function safeTokenEquals(candidate: string, expected: string): boolean {
+  const candidateBuffer = Buffer.from(candidate);
+  const expectedBuffer = Buffer.from(expected);
+  return (
+    candidateBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(candidateBuffer, expectedBuffer)
+  );
+}
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const grantIdParams = z.object({ id: z.string().uuid(), grantId: z.string().uuid() });
+const createUserBody = z.object({
+  name: z.string().trim().min(1).max(80),
+  // role only has any effect when the caller is already authenticated as an
+  // admin -- AgentService re-validates this itself; the route never trusts
+  // it on its own. password is optional: without one, this account can
+  // only ever authenticate with the token returned right here (today's
+  // original behavior).
+  role: z.enum(["member", "admin"]).optional(),
+  password: z.string().min(8).max(200).optional(),
+});
+const loginBody = z.object({
+  name: z.string().trim().min(1).max(80),
+  password: z.string().min(1).max(200),
+});
+const grantBody = z.object({
+  // Not `.uuid()`: a seeded APP_USERS id can be any string (e.g. "u-alice").
+  userId: z.string().trim().min(1),
+  role: z.enum(["viewer", "operator"]),
+});
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  // Runtime policy. AgentService restricts changing these to the Agent's
+  // owner or an admin, even though ordinary fields above only need "write".
+  sandboxMode: z.enum(["read-only", "workspace-write"]).optional(),
+  networkAccess: z.boolean().optional(),
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -44,21 +84,50 @@ export async function createApp(
 
   app.addHook("onRequest", async (request, reply) => {
     if (
-      !config.authToken ||
       !request.url.startsWith("/api/") ||
       request.url === "/api/health" ||
-      request.url === "/api/auth"
+      request.url === "/api/auth" ||
+      request.url === "/api/login"
     ) {
+      // /api/login is a credential exchange (name+password -> token), so it
+      // necessarily runs before any token exists to present.
       return;
     }
     const header = request.headers.authorization ?? "";
     const candidate = header.startsWith("Bearer ") ? header.slice(7) : "";
-    const expectedBuffer = Buffer.from(config.authToken);
-    const candidateBuffer = Buffer.from(candidate);
-    const valid =
-      candidateBuffer.length === expectedBuffer.length &&
-      timingSafeEqual(candidateBuffer, expectedBuffer);
-    if (!valid) {
+
+    if (request.url === "/api/users") {
+      // Reachable pre-auth on purpose: GET only ever returns id/name (no
+      // tokens), and POST is self-registration, so a caller needs no
+      // credential yet to see who exists or to become someone. But if a
+      // valid token IS presented, resolve it anyway -- an authenticated
+      // owner/admin uses this same POST to promote a role or bundle a
+      // Grant, and AgentService needs request.authUser to check that.
+      if (service.hasIdentityEnabled() && candidate) {
+        const user = service.resolveUserByToken(candidate);
+        if (user) request.authUser = user;
+      }
+      return;
+    }
+
+    if (service.hasIdentityEnabled()) {
+      // Access-control mode: activates the moment any user exists (seeded
+      // via APP_USERS, or self-registered through POST /api/users). Each
+      // caller must present a token that resolves to a real user; that
+      // identity drives ownership/Grant checks in AgentService for the
+      // rest of the request.
+      const user = service.resolveUserByToken(candidate);
+      if (!user) {
+        return reply.code(401).send({ error: "Authentication required" });
+      }
+      request.authUser = user;
+      return;
+    }
+
+    if (!config.authToken) {
+      return;
+    }
+    if (!safeTokenEquals(candidate, config.authToken)) {
       return reply.code(401).send({ error: "Authentication required" });
     }
   });
@@ -68,64 +137,112 @@ export async function createApp(
     service: "volc-agent-launchpad",
   }));
 
-  app.get("/api/auth", async () => ({ required: config.authToken.length > 0 }));
+  app.get("/api/auth", async () => ({
+    required: config.authToken.length > 0 || service.hasIdentityEnabled(),
+    // Once any user exists, the legacy shared token stops being checked at
+    // all (see the onRequest hook above) -- the frontend uses this to stop
+    // offering it as an option once it can never actually work.
+    identityEnabled: service.hasIdentityEnabled(),
+  }));
+
+  app.get("/api/whoami", async (request) => ({
+    user: request.authUser ?? null,
+  }));
+
+  app.get("/api/users", async () => ({ users: service.listUsers() }));
+
+  app.post("/api/users", async (request, reply) => {
+    const body = createUserBody.parse(request.body);
+    const result = await service.createUser(body.name, {
+      actor: request.authUser ?? null,
+      role: body.role,
+      password: body.password,
+    });
+    return reply.code(201).send(result);
+  });
+
+  app.post("/api/login", async (request, reply) => {
+    const body = loginBody.parse(request.body);
+    const result = await service.login(body.name, body.password);
+    return reply.code(200).send(result);
+  });
 
   app.get("/api/system", async () => service.systemInfo());
 
-  app.get("/api/agents", async () => ({ agents: service.listAgents() }));
+  app.get("/api/agents", async (request) => ({
+    agents: service.listAgents(request.authUser ?? null),
+  }));
 
   app.post("/api/agents", async (request, reply) => {
     const body = createAgentBody.parse(request.body);
-    const agent = await service.createAgent(body);
+    const agent = await service.createAgent(body, request.authUser?.id);
     return reply.code(201).send({ agent });
   });
 
   app.get("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: service.getAgent(id) };
+    return { agent: service.getAgent(id, request.authUser ?? null) };
   });
 
   app.patch("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     const body = updateAgentBody.parse(request.body);
-    return { agent: await service.updateAgent(id, body) };
+    return { agent: await service.updateAgent(id, body, request.authUser ?? null) };
   });
 
   app.delete("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return service.deleteAgent(id);
+    return service.deleteAgent(id, request.authUser ?? null);
   });
 
   app.post("/api/agents/:id/start", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: await service.startAgent(id) };
+    return { agent: await service.startAgent(id, request.authUser ?? null) };
   });
 
   app.post("/api/agents/:id/stop", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: await service.stopAgent(id) };
+    return { agent: await service.stopAgent(id, request.authUser ?? null) };
   });
 
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { messages: service.getMessages(id) };
+    return { messages: service.getMessages(id, request.authUser ?? null) };
   });
 
   app.get("/api/agents/:id/runs", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { runs: service.getRuns(id) };
+    return { runs: service.getRuns(id, request.authUser ?? null) };
   });
 
   app.post("/api/agents/:id/messages", async (request, reply) => {
     const { id } = agentIdParams.parse(request.params);
     const body = messageBody.parse(request.body);
-    const result = await service.sendMessage(id, body.content);
+    const result = await service.sendMessage(id, body.content, request.authUser ?? null);
     return reply.code(202).send(result);
   });
 
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
-    return { run: service.getRun(id) };
+    return { run: service.getRun(id, request.authUser ?? null) };
+  });
+
+  app.post("/api/agents/:id/grants", async (request, reply) => {
+    const { id } = agentIdParams.parse(request.params);
+    const body = grantBody.parse(request.body);
+    const grant = await service.createGrant(id, request.authUser ?? null, body.userId, body.role);
+    return reply.code(201).send({ grant });
+  });
+
+  app.get("/api/agents/:id/grants", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { grants: service.listGrants(id, request.authUser ?? null) };
+  });
+
+  app.delete("/api/agents/:id/grants/:grantId", async (request, reply) => {
+    const { id, grantId } = grantIdParams.parse(request.params);
+    await service.revokeGrant(id, grantId, request.authUser ?? null);
+    return reply.code(204).send();
   });
 
   if (config.nodeEnv === "production") {

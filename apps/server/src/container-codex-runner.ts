@@ -54,8 +54,11 @@ export function buildContainerRunArgs(
     "--label",
     "io.codejam.instance-id=" + config.runtimeInstanceId,
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
+    // Per-Agent: "none" makes the container unable to reach anything at
+    // all, which is what actually stops dependency installs and outbound
+    // calls -- not a check on the command text itself.
     "--network",
-    "bridge",
+    request.networkAccess ? "bridge" : "none",
     "--security-opt",
     "no-new-privileges",
     "--cap-drop",
@@ -84,7 +87,7 @@ export function buildContainerRunArgs(
     "/workspace",
     config.containerRuntimeImage,
     "codex",
-    ...buildCodexArgs(request, config.codexSandboxMode, "/workspace"),
+    ...buildCodexArgs(request, request.sandboxMode, "/workspace"),
   ];
 }
 

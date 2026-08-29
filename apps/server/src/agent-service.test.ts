@@ -80,6 +80,30 @@ describe("Agent lifecycle", () => {
     expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
   });
 
+  it("redacts the real workspace path out of Codex's own output before storing it", async () => {
+    const leakyRunner: AgentRunner = {
+      run: async (request) => ({
+        output:
+          "I can't write to " +
+          request.workspacePath +
+          " (uid=1000). Try somewhere under $CODEX_HOME instead.",
+        threadId: "fake-thread",
+        usage: null,
+      }),
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const service = await makeService(leakyRunner);
+    const agent = await service.createAgent({ name: "Leaky" });
+    await service.sendMessage(agent.id, "create a file");
+    await expect.poll(() => service.getMessages(agent.id).length).toBe(2);
+    const [, assistantMessage] = service.getMessages(agent.id);
+    expect(assistantMessage?.content).not.toContain(agent.workspacePath);
+    expect(assistantMessage?.content).not.toContain("uid=1000");
+    expect(assistantMessage?.content).toContain("[agent workspace path redacted]");
+    expect(assistantMessage?.content).toContain("uid [redacted]");
+  });
+
   it("atomically accepts only one concurrent run per Agent", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {
@@ -129,5 +153,102 @@ describe("Agent lifecycle", () => {
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+});
+
+describe("systemInfo reports the true enforcement boundary", () => {
+  // The web UI's "networkAccess is a no-op here" warning (App.tsx) trusts
+  // this field completely -- if it ever misreported "container" while
+  // actually running as a host process, that warning would silently stop
+  // showing up exactly when it matters most.
+  it("reports runtimeProvider matching the actual configured value, not a hardcoded default", async () => {
+    for (const runtimeProvider of ["local-process", "container"] as const) {
+      const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+      temporaryDirectories.push(root);
+      const config = loadConfig({
+        NODE_ENV: "test",
+        APP_DATA_DIR: path.join(root, "data"),
+        AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+        CODEX_HOME: path.join(root, "codex"),
+        ARK_API_KEY: "test-key",
+        ARK_MODEL: "ep-test",
+        RUNTIME_PROVIDER: runtimeProvider,
+      });
+      const service = new AgentService(
+        config,
+        new JsonStore(path.join(root, "data", "db.json")),
+        new WorkspaceManager(path.join(root, "workspaces")),
+        new FakeRunner(),
+      );
+      await service.initialize();
+
+      const info = await service.systemInfo();
+      expect(info.runtimeProvider).toBe(runtimeProvider);
+      // containerEngine is only meaningful when a container boundary
+      // actually exists -- reporting one for local-process would be a lie
+      // the UI has no way to catch.
+      expect(info.containerEngine).toBe(runtimeProvider === "container" ? config.containerEngine : null);
+    }
+  });
+});
+
+describe("Runtime policy back-compat", () => {
+  it("backfills sandboxMode/networkAccess for Agents stored before those fields existed", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const dataDir = path.join(root, "data");
+    await mkdir(dataDir, { recursive: true });
+    // Simulates a database.json written before sandboxMode/networkAccess
+    // existed: the stored Agent simply has neither key.
+    await writeFile(
+      path.join(dataDir, "db.json"),
+      JSON.stringify({
+        version: 1,
+        agents: [
+          {
+            id: "11111111-1111-1111-1111-111111111111",
+            name: "Legacy Agent",
+            description: "",
+            instructions: "",
+            status: "ready",
+            ownerId: "unclaimed",
+            workspacePath: path.join(root, "workspaces", "11111111-1111-1111-1111-111111111111"),
+            codexThreadId: null,
+            lastError: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            updatedAt: "2025-01-01T00:00:00.000Z",
+          },
+        ],
+        messages: [],
+        runs: [],
+        users: [],
+        grants: [],
+      }),
+      "utf8",
+    );
+
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: dataDir,
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      ARK_API_KEY: "test-key",
+      ARK_MODEL: "ep-test",
+      CODEX_SANDBOX_MODE: "read-only",
+    });
+    const service = new AgentService(
+      config,
+      new JsonStore(path.join(dataDir, "db.json")),
+      new WorkspaceManager(path.join(root, "workspaces")),
+      new FakeRunner(),
+    );
+    await service.initialize();
+
+    const agent = service.getAgent("11111111-1111-1111-1111-111111111111");
+    // Backfilled to the platform's configured default at the time, not a
+    // hardcoded string -- proving it reads real config, not a guess.
+    expect(agent.sandboxMode).toBe("read-only");
+    expect(agent.networkAccess).toBe(true);
   });
 });

@@ -50,11 +50,13 @@ requested_sandbox_mode="${requested_sandbox_mode:-workspace-write}"
 if [[ "$requested_sandbox_mode" == "workspace-write" ]] \
   && ! docker compose --env-file "$env_file" exec -T launchpad \
     codex sandbox linux --full-auto -- true >/dev/null 2>&1; then
-  echo "Codex Landlock is unavailable on this Linux kernel/container runtime." >&2
-  echo "Falling back to danger-full-access inside the outer Docker boundary." >&2
-  echo "This POC does not provide per-Agent isolation; do not store unrelated secrets in it." >&2
-  export CODEX_SANDBOX_MODE=danger-full-access
-  docker compose --env-file "$env_file" up -d --no-build --force-recreate
+  echo "Codex Landlock is unavailable on this Linux kernel/container runtime," >&2
+  echo "so the platform's per-Agent sandbox boundary cannot be enforced." >&2
+  echo "Refusing to run Agents with unrestricted filesystem access -- stopping" >&2
+  echo "the deployment instead of silently degrading it." >&2
+  echo "Use a host kernel with Landlock support (Linux 5.13+)." >&2
+  docker compose --env-file "$env_file" down
+  exit 3
 fi
 docker compose --env-file "$env_file" ps
 
