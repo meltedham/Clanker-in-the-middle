@@ -358,7 +358,8 @@ button {
 }
 
 .config-banner,
-.error-banner {
+.error-banner,
+.connection-banner {
   max-width: 1180px;
   margin: 0 auto 14px;
   display: flex;
@@ -366,6 +367,13 @@ button {
   border-radius: 10px;
   padding: 10px 13px;
   font-size: 12px;
+}
+
+.connection-banner {
+  gap: 9px;
+  color: #6c541b;
+  background: #fff7d8;
+  border: 1px solid #eddda1;
 }
 
 .config-banner {
@@ -822,6 +830,74 @@ textarea:focus {
   padding: 10px 12px;
   color: #9e4545;
   font-size: 11px;
+}
+
+.trace-panel {
+  margin: 0 max(22px, calc((100% - 800px) / 2)) 12px;
+  border: 1px solid #e1dfd8;
+  border-radius: 10px;
+  background: #fbfaf7;
+  padding: 10px 12px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.trace-empty {
+  color: #96968f;
+  font-size: 11px;
+  margin: 0;
+}
+
+.trace-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trace-event {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+  color: #55564f;
+  border-bottom: 1px dashed #e9e7e0;
+  padding-bottom: 4px;
+}
+
+.trace-seq {
+  color: #96968f;
+  min-width: 16px;
+}
+
+.trace-time {
+  color: #96968f;
+}
+
+.trace-type {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 9px;
+}
+
+.trace-summary {
+  overflow-wrap: anywhere;
+}
+
+.trace-cancelled .trace-type,
+.trace-error .trace-type {
+  color: #9e4545;
+}
+
+.trace-reconciliation .trace-type {
+  color: #8a6d1f;
+}
+
+.trace-completed .trace-type {
+  color: #3f7a4d;
 }
 
 .composer {

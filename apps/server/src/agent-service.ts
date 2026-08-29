@@ -9,12 +9,23 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  RunnerCallbacks,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+/**
+ * Control Plane: Agent specification, validation, status, Run
+ * orchestration, and reconciliation (matches the "Control Plane" row of the
+ * layered architecture in bff.pdf/AGENT_BRIEF.md). This class only ever
+ * depends on the plain `AgentRunner` interface -- it has no knowledge of,
+ * and no dependency on, the observability middleware
+ * (`middleware/observability-runner.ts`) that may or may not be wrapping
+ * whatever runner it was constructed with. That composition happens once,
+ * in `runner-factory.ts`.
+ */
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
@@ -29,14 +40,13 @@ export class AgentService {
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    const interrupted = this.store
+      .snapshot()
+      .runs.filter((run) => run.status === "queued" || run.status === "running");
+    for (const run of interrupted) {
+      await this.reconcileRun(run);
+    }
     await this.store.mutate((database) => {
-      for (const run of database.runs) {
-        if (run.status === "queued" || run.status === "running") {
-          run.status = "cancelled";
-          run.error = "Server restarted while this run was active";
-          run.completedAt = now();
-        }
-      }
       for (const agent of database.agents) {
         if (agent.status === "busy") {
           agent.status = "ready";
@@ -44,6 +54,83 @@ export class AgentService {
         }
       }
     });
+  }
+
+  /**
+   * Called once per interrupted Run during boot. Asks the runner whether the
+   * execution behind this Run survived the restart; if it did, lets it run
+   * to completion instead of declaring the Run dead. Either way, whatever
+   * was already checkpointed on the Run/Agent via `onProgress` before the
+   * restart (partial output, a discovered thread id) is preserved, not
+   * overwritten with a blank slate.
+   */
+  private async reconcileRun(run: AgentRun): Promise<void> {
+    const callbacks = this.progressCallbacks(run.id, run.agentId);
+    const outcome = await this.runner.reconcile(run.agentId, run.runnerHandle, run.id, callbacks);
+    const completedAt = now();
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      const agent = database.agents.find((item) => item.id === run.agentId);
+      if (!storedRun) return;
+      if (outcome.result) {
+        storedRun.status = "completed";
+        storedRun.output = outcome.result.output;
+        storedRun.usage = outcome.result.usage;
+        storedRun.partial = false;
+        storedRun.completedAt = completedAt;
+        if (agent) {
+          database.messages.push({
+            id: randomUUID(),
+            agentId: agent.id,
+            runId: storedRun.id,
+            role: "assistant",
+            content: outcome.result.output,
+            createdAt: completedAt,
+          });
+          agent.codexThreadId = outcome.result.threadId;
+          agent.lastError = null;
+        }
+      } else {
+        storedRun.status = "cancelled";
+        storedRun.error = outcome.reason;
+        storedRun.completedAt = completedAt;
+        // storedRun.output / agent.codexThreadId are left exactly as the
+        // progress callbacks above (or the interrupted run itself) already
+        // set them -- reconciliation never blanks out a partial result.
+      }
+    });
+  }
+
+  /**
+   * Shared onHandle/onProgress wiring used by both a live execution and
+   * reconciliation of an interrupted one. This is purely store
+   * checkpointing (Solution 1) -- it has no knowledge of tracing. Whatever
+   * runner `this.runner` actually is may separately be observing these same
+   * callback firings for its own purposes (see `ObservabilityRunner`); that
+   * happens transparently, outside this class.
+   */
+  private progressCallbacks(runId: string, agentId: string): RunnerCallbacks {
+    return {
+      onHandle: (handle) => {
+        void this.store.mutate((database) => {
+          const storedRun = database.runs.find((item) => item.id === runId);
+          if (storedRun) storedRun.runnerHandle = handle;
+        });
+      },
+      onProgress: (progress) => {
+        void this.store.mutate((database) => {
+          const storedRun = database.runs.find((item) => item.id === runId);
+          const agent = database.agents.find((item) => item.id === agentId);
+          if (progress.threadId && agent) {
+            agent.codexThreadId = progress.threadId;
+          }
+          if (progress.message && storedRun) {
+            storedRun.output = progress.message;
+            storedRun.partial = true;
+          }
+        });
+      },
+    };
   }
 
   listAgents(): Agent[] {
@@ -173,6 +260,8 @@ export class AgentService {
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
+      partial: false,
+      runnerHandle: null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -244,12 +333,16 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
-      const result = await this.runner.run({
-        agentId: agentAtStart.id,
-        workspacePath: agentAtStart.workspacePath,
-        prompt: run.prompt,
-        threadId: agentAtStart.codexThreadId,
-      });
+      const result = await this.runner.run(
+        {
+          agentId: agentAtStart.id,
+          runId: run.id,
+          workspacePath: agentAtStart.workspacePath,
+          prompt: run.prompt,
+          threadId: agentAtStart.codexThreadId,
+        },
+        this.progressCallbacks(run.id, agentAtStart.id),
+      );
       const completedAt = now();
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
@@ -258,6 +351,7 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
+        storedRun.partial = false;
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),

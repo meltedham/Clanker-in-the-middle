@@ -41,6 +41,10 @@ export interface AgentRun {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
+  /** true if `output` was captured from an in-progress checkpoint rather than a natural completion. */
+  partial: boolean;
+  /** Opaque runner-owned identity (e.g. "container:launchpad-default-<id>" or "pid:1234") used to reconcile after a restart. */
+  runnerHandle: string | null;
 }
 
 export interface Database {
@@ -70,13 +74,56 @@ export interface RunnerResult {
 
 export interface RunnerRequest {
   agentId: string;
+  /** The AgentRun this execution belongs to. Runners don't need it themselves; it exists so runner middleware (e.g. an observability wrapper) can correlate its own side-channel data to the right Run without reaching into the store. */
+  runId: string;
   workspacePath: string;
   prompt: string;
   threadId: string | null;
 }
 
+/** Incremental progress reported while a Run is still executing. */
+export interface RunnerProgress {
+  /** Set once, as soon as Codex reports (or resumes) a thread id. */
+  threadId?: string;
+  /** Latest known agent_message text seen so far; overwrites previous values. */
+  message?: string;
+}
+
+export interface RunnerCallbacks {
+  /** Fired once, as soon as the runner has an identity for `reconcile()` to use later (before the process/container necessarily exits). */
+  onHandle?: (handle: string) => void;
+  /** Fired whenever new progress is parsed from the runner's output stream. */
+  onProgress?: (progress: RunnerProgress) => void;
+}
+
+export interface ReconcileOutcome {
+  /** true if the runner found the previous execution still alive at boot and reattached to it. */
+  stillRunning: boolean;
+  /** Human-readable explanation of what reconciliation found/did, always present. */
+  reason: string;
+  /**
+   * Present only when reattachment ran the interrupted execution to a real,
+   * natural completion (i.e. `stillRunning` was true and it then finished
+   * successfully). When absent, the caller must fall back to whatever was
+   * already checkpointed via `onProgress` before the interruption.
+   */
+  result?: RunnerResult;
+}
+
 export interface AgentRunner {
-  run(request: RunnerRequest): Promise<RunnerResult>;
+  run(request: RunnerRequest, callbacks?: RunnerCallbacks): Promise<RunnerResult>;
   cancel(agentId: string): Promise<boolean>;
   isAvailable(): Promise<boolean>;
+  /**
+   * Called on server boot for any Run that was left `queued`/`running` when the
+   * process last stopped. `handle` is the `AgentRun.runnerHandle` recorded before
+   * the interruption, or null if none was ever captured. `runId` is passed for
+   * the same correlation reason as `RunnerRequest.runId`.
+   */
+  reconcile(
+    agentId: string,
+    handle: string | null,
+    runId: string,
+    callbacks?: RunnerCallbacks,
+  ): Promise<ReconcileOutcome>;
 }

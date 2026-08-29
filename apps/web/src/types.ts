@@ -36,6 +36,28 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  /** true if `output` was captured from an in-progress checkpoint rather than a natural completion. */
+  partial?: boolean;
+}
+
+export type RunEventType =
+  | "runner_attached"
+  | "thread_started"
+  | "agent_message"
+  | "turn_completed"
+  | "error"
+  | "cancelled"
+  | "completed"
+  | "reconciliation";
+
+export interface RunEvent {
+  seq: number;
+  runId: string;
+  agentId: string;
+  type: RunEventType;
+  occurredAt: string;
+  summary: string;
+  detail?: Record<string, unknown>;
 }
 
 export interface SystemInfo {

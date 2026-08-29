@@ -7,6 +7,7 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
+import type { TraceReader } from "./middleware/trace-store.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
@@ -23,9 +24,16 @@ const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
 
+/**
+ * `trace` is a `TraceReader`, not the concrete trace-store writer -- the
+ * API layer (Experience Layer boundary) only ever needs read access to the
+ * Observability middleware's data; writes happen exclusively inside
+ * `middleware/observability-runner.ts`, which this function never touches.
+ */
 export async function createApp(
   config: AppConfig,
   service: AgentService,
+  trace: TraceReader,
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -126,6 +134,12 @@ export async function createApp(
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
     return { run: service.getRun(id) };
+  });
+
+  app.get("/api/runs/:id/trace", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    service.getRun(id); // Control Plane confirms the Run exists (404 otherwise)...
+    return { events: await trace.read(id) }; // ...Observability Layer supplies its data.
   });
 
   if (config.nodeEnv === "production") {

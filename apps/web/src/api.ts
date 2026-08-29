@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, RunEvent, SystemInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -78,4 +78,5 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  trace: (id: string) => request<{ events: RunEvent[] }>("/api/runs/" + id + "/trace"),
 };

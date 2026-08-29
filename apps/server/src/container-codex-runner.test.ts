@@ -21,6 +21,7 @@ describe("Container Codex runner", () => {
     const args = buildContainerRunArgs(
       {
         agentId: "agent/unsafe",
+        runId: "run-1",
         workspacePath: "/tmp/agent-workspace",
         prompt: "write a small program",
         threadId: null,
@@ -33,7 +34,12 @@ describe("Container Codex runner", () => {
     );
     expect(args).toContain("runtime:test");
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
-    expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
+    // `config.codexHome` is `path.resolve(CODEX_HOME)`, which normalizes
+    // separators per-OS (e.g. to a `C:\...` path on Windows dev machines).
+    // Assert against the actual resolved value rather than a hardcoded
+    // POSIX string, so this test is correct on every platform, not just the
+    // macOS/Linux hosts this project targets for deployment.
+    expect(args).toContain("type=bind,src=" + config.codexHome + ",dst=/codex-home");
     expect(args).toContain("501:20");
     expect(args).toContain("workspace-write");
     expect(args).toContain("/workspace");
@@ -51,6 +57,7 @@ describe("Container Codex runner", () => {
     const args = buildContainerRunArgs(
       {
         agentId: "agent",
+        runId: "run-1",
         workspacePath: "/tmp/workspace",
         prompt: "continue",
         threadId: "thread-123",

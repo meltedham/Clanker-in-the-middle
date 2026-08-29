@@ -8,9 +8,13 @@ Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
 
 > [!WARNING]
-> This is a single-user proof of concept. It intentionally has no identity,
-> tracing, audit, or hardened sandbox middleware. Do not use production data or
-> credentials. See [SECURITY.md](SECURITY.md).
+> This is a single-user proof of concept. It intentionally has no identity or
+> hardened sandbox middleware. Do not use production data or credentials. See
+> [SECURITY.md](SECURITY.md).
+
+**Selected track: Glass Box (trace and audit)**, extended with a lifecycle
+reconciliation / failure-recovery capability — see
+[Middleware](#middleware-run-reliability--observability) below.
 
 ## Screenshots
 
@@ -30,6 +34,56 @@ Volcengine ECS.
 - Persistent Agent workspaces and Codex sessions
 - Disposable Docker, Colima, or Podman container for each local turn
 - Docker and Terraform deployment paths for Volcengine ECS
+
+## Middleware: Run Reliability & Observability
+
+**Problem:** a Run's progress (a discovered Codex thread, streamed output)
+lived only in transient, in-process memory until it finished naturally. Any
+interruption — a server restart, an explicit Stop, a dropped client
+connection — was treated as total data loss dressed up as a status
+transition, rather than something to reconcile or make visible.
+
+**What was added, and where it lives:**
+
+- `apps/server/src/middleware/observability-runner.ts` — `ObservabilityRunner`
+  wraps the `AgentRunner` interface (the seam this repo already calls out as
+  "the place for runtime-specific behavior") and mirrors every Run's
+  lifecycle into a redacted, append-only, per-Run trace
+  (`middleware/trace-store.ts`), without `AgentService` (the Control Plane)
+  knowing tracing exists at all. `GET /api/runs/:id/trace` exposes it; the
+  Playground has a "View trace" toggle.
+- `AgentService.initialize()` now **reconciles** any Run left
+  `queued`/`running` after a restart instead of blind-cancelling it: a
+  still-running local container is reattached (`docker logs -f`) instead of
+  being declared dead, and whatever thread id / partial output was already
+  checkpointed survives either way — including across an explicit Stop, so
+  the next message resumes the same Codex thread instead of starting fresh.
+
+**Boundary, data flow, and design rationale:** [`docs/ARCHITECTURE.md#middleware`](docs/ARCHITECTURE.md#middleware)
+for the short version; [`docs/reliability/`](docs/reliability/README.md) for
+the full root-cause analysis and per-capability design docs.
+
+**Demo it yourself:**
+
+1. Send a Playground prompt, click **Stop** mid-turn, then send a follow-up
+   message — Codex still has context from the interrupted turn. Open **View
+   trace** to see the `cancelled` event next to the `thread_started` event
+   it preserved.
+2. Under `RUNTIME_PROVIDER=container`, start a Run, kill the server process
+   while it's `running`, and restart it: the Run either finishes (its
+   container was reattached) or lands `cancelled` with its last
+   checkpointed output intact — never a blank slate.
+
+**Automated verification:** `apps/server/src/middleware/observability-runner.test.ts`
+and the "Run interruption and recovery" cases in `agent-service.test.ts`
+cover both the normal and interrupted paths.
+
+**Known limitations:** the container-reattachment path is covered by unit
+tests against a mocked runner, not yet exercised against a live
+Docker/Colima/Podman daemon; local-process (`RUNTIME_PROVIDER=local-process`)
+Runs cannot be reattached after a hard crash, only checkpointed-and-preserved
+(a stated ceiling of that profile, not a bug). Full status, what's verified
+vs. not, and what to do next: [`docs/reliability/README.md`](docs/reliability/README.md).
 
 ## Requirements
 
@@ -240,6 +294,7 @@ docker compose config
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Run reliability & observability middleware](docs/reliability/README.md)
 - [Local POC](docs/LOCAL_POC.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Hackathon extension guide](docs/HACKATHON_EXTENSION_GUIDE.md)

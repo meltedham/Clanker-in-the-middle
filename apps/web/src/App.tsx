@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import { isRetryableApiError, withRetry } from "./reconnect";
+import type { Agent, AgentRun, Message, RunEvent, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -45,15 +46,21 @@ export default function App() {
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [connectionState, setConnectionState] = useState<"connected" | "lost">("connected");
+  const [showTrace, setShowTrace] = useState(false);
+  const [traceEvents, setTraceEvents] = useState<RunEvent[] | null>(null);
+  const [traceLoading, setTraceLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [authInput, setAuthInput] = useState("");
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
+  const activeRunRef = useRef<AgentRun | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
   selectedIdRef.current = selectedId;
+  activeRunRef.current = activeRun;
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
@@ -99,6 +106,9 @@ export default function App() {
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setShowTrace(false);
+    setTraceEvents(null);
+    setConnectionState("connected");
     if (!selectedId) {
       setMessages([]);
       return;
@@ -132,6 +142,31 @@ export default function App() {
   useEffect(() => {
     messageEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, activeRun]);
+
+  useEffect(() => {
+    const resync = () => {
+      const agentId = selectedIdRef.current;
+      if (!agentId || !mountedRef.current) return;
+      void refreshAgents();
+      void refreshMessages(agentId);
+      const run = activeRunRef.current;
+      // pollRun's own `pollingRunIds` guard makes a redundant call a safe no-op.
+      if (run && ["queued", "running"].includes(run.status)) {
+        void pollRun(run.id, agentId);
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") resync();
+    };
+    window.addEventListener("focus", resync);
+    window.addEventListener("online", resync);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", resync);
+      window.removeEventListener("online", resync);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshAgents, refreshMessages]);
 
   const createAgent = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -208,7 +243,23 @@ export default function App() {
       while (mountedRef.current) {
         await new Promise((resolve) => window.setTimeout(resolve, 900));
         if (!mountedRef.current) return;
-        const result = await api.run(runId);
+        let result: { run: AgentRun };
+        try {
+          result = await withRetry(() => api.run(runId), {
+            maxAttempts: 8,
+            baseDelayMs: 1_000,
+            maxDelayMs: 15_000,
+            isRetryable: isRetryableApiError,
+          });
+        } catch {
+          // Exhausted the retry budget (roughly two minutes) for this tick.
+          // Don't give up on the Run -- the server may still finish it --
+          // just surface that the connection is unhealthy and let the
+          // outer 900ms loop try again on the next tick.
+          if (mountedRef.current) setConnectionState("lost");
+          continue;
+        }
+        if (mountedRef.current) setConnectionState("connected");
         if (selectedIdRef.current === agentId) setActiveRun(result.run);
         if (!["queued", "running"].includes(result.run.status)) {
           await Promise.all([refreshMessages(agentId), refreshAgents()]);
@@ -217,6 +268,24 @@ export default function App() {
       }
     } finally {
       pollingRunIds.current.delete(runId);
+    }
+  };
+
+  const toggleTrace = async () => {
+    if (showTrace) {
+      setShowTrace(false);
+      return;
+    }
+    setShowTrace(true);
+    if (!activeRun) return;
+    setTraceLoading(true);
+    try {
+      const result = await api.trace(activeRun.id);
+      setTraceEvents(result.events);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setTraceLoading(false);
     }
   };
 
@@ -385,6 +454,13 @@ export default function App() {
           </div>
         ) : null}
 
+        {connectionState === "lost" && (
+          <div className="connection-banner" role="status">
+            <Spinner />
+            Reconnecting to the control plane…
+          </div>
+        )}
+
         {error && (
           <div className="error-banner" role="alert">
             <span>{error}</span>
@@ -486,8 +562,34 @@ export default function App() {
                 <div className="session-info">
                   <span className="pulse" />
                   {selected.codexThreadId ? "Session connected" : "New session"}
+                  {activeRun && (
+                    <button type="button" className="button button-ghost" onClick={toggleTrace}>
+                      {showTrace ? "Hide trace" : "View trace"}
+                    </button>
+                  )}
                 </div>
               </div>
+
+              {showTrace && activeRun && (
+                <div className="trace-panel" aria-live="polite">
+                  {traceLoading ? (
+                    <Spinner />
+                  ) : traceEvents && traceEvents.length > 0 ? (
+                    <ul className="trace-list">
+                      {traceEvents.map((event) => (
+                        <li key={event.seq} className={"trace-event trace-" + event.type}>
+                          <span className="trace-seq">{event.seq}</span>
+                          <span className="trace-time">{formatTime(event.occurredAt)}</span>
+                          <span className="trace-type">{event.type}</span>
+                          <span className="trace-summary">{event.summary}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="trace-empty">No trace events recorded for this Run yet.</p>
+                  )}
+                </div>
+              )}
 
               <div className="messages">
                 {messages.length === 0 && !activeRun ? (

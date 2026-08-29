@@ -1,11 +1,13 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
-import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import { buildCodexArgs, createProgressReporter, parseCodexEventLine } from "./codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
+  ReconcileOutcome,
   RunUsage,
+  RunnerCallbacks,
   RunnerRequest,
   RunnerResult,
 } from "./types.js";
@@ -137,11 +139,13 @@ export class ContainerCodexRunner implements AgentRunner {
     return active.termination;
   }
 
-  async run(request: RunnerRequest): Promise<RunnerResult> {
+  async run(request: RunnerRequest, callbacks?: RunnerCallbacks): Promise<RunnerResult> {
     if (this.active.has(request.agentId)) {
       throw new Error("Agent already has an active Runtime container");
     }
 
+    const name = containerName(request.agentId, this.config.runtimeInstanceId);
+    callbacks?.onHandle?.("container:" + name);
     const child = spawn(
       this.config.containerEngine,
       buildContainerRunArgs(request, this.config),
@@ -157,7 +161,7 @@ export class ContainerCodexRunner implements AgentRunner {
     });
     const active: ActiveContainer = {
       child,
-      containerName: containerName(request.agentId, this.config.runtimeInstanceId),
+      containerName: name,
       cancelled: false,
       timedOut: false,
       outputExceeded: false,
@@ -175,6 +179,7 @@ export class ContainerCodexRunner implements AgentRunner {
     let stdout = "";
     let stderr = "";
     let totalBytes = 0;
+    const reportProgress = createProgressReporter(parsed, callbacks);
 
     const consume = (chunk: Buffer, target: "stdout" | "stderr") => {
       totalBytes += chunk.byteLength;
@@ -188,6 +193,7 @@ export class ContainerCodexRunner implements AgentRunner {
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
         for (const line of lines) parseCodexEventLine(line, parsed);
+        reportProgress();
       } else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) stderr = stderr.slice(-16_384);
@@ -208,7 +214,10 @@ export class ContainerCodexRunner implements AgentRunner {
         child.once("error", reject);
         child.once("close", (code) => resolve(code ?? 1));
       });
-      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed);
+      if (stdout.trim()) {
+        parseCodexEventLine(stdout.trim(), parsed);
+        reportProgress();
+      }
       if (active.cancelled) throw new RunCancelledError();
       if (active.timedOut) {
         throw new Error("Runtime timed out after " + this.config.codexTimeoutMs + " ms");
@@ -233,6 +242,86 @@ export class ContainerCodexRunner implements AgentRunner {
       clearTimeout(timeout);
       this.active.delete(request.agentId);
     }
+  }
+
+  /**
+   * Runs with `--rm`, so a container that finished while the server was
+   * down is already gone -- there is nothing left to inspect. But a
+   * container that was still mid-turn survives a server restart (it is not
+   * a child process of Node), so it can be found by its deterministic name
+   * and reattached to via `docker logs -f`, letting the interrupted turn
+   * finish for real instead of being declared cancelled.
+   */
+  async reconcile(
+    agentId: string,
+    handle: string | null,
+    _runId: string,
+    callbacks?: RunnerCallbacks,
+  ): Promise<ReconcileOutcome> {
+    const name = handle?.startsWith("container:")
+      ? handle.slice("container:".length)
+      : containerName(agentId, this.config.runtimeInstanceId);
+
+    let running: boolean;
+    try {
+      const { stdout } = await execFileAsync(
+        this.config.containerEngine,
+        ["ps", "--filter", "name=" + name, "--filter", "status=running", "--format", "{{.Names}}"],
+        { timeout: 8_000, env: this.childEnvironment() },
+      );
+      running = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .includes(name);
+    } catch {
+      return {
+        stillRunning: false,
+        reason: "Could not query " + this.config.containerEngine + " for container " + name,
+      };
+    }
+
+    if (!running) {
+      return {
+        stillRunning: false,
+        reason: "No running container named " + name + " was found after restart",
+      };
+    }
+
+    const parsed: ParsedEvents = { messages: [], threadId: null, usage: null, errors: [] };
+    const reportProgress = createProgressReporter(parsed, callbacks);
+    let stdout = "";
+    const logs = spawn(this.config.containerEngine, ["logs", "-f", name], {
+      env: this.childEnvironment(),
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    logs.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() ?? "";
+      for (const line of lines) parseCodexEventLine(line, parsed);
+      reportProgress();
+    });
+    await new Promise<void>((resolve) => {
+      logs.once("close", () => resolve());
+      logs.once("error", () => resolve());
+    });
+    if (stdout.trim()) {
+      parseCodexEventLine(stdout.trim(), parsed);
+      reportProgress();
+    }
+
+    const output = parsed.messages.at(-1)?.trim();
+    if (output) {
+      return {
+        stillRunning: true,
+        reason: "Reattached to a running container and captured its completed output",
+        result: { output, threadId: parsed.threadId, usage: parsed.usage },
+      };
+    }
+    return {
+      stillRunning: true,
+      reason: "Reattached to a running container, but it exited without an agent message",
+    };
   }
 
   private childEnvironment(): NodeJS.ProcessEnv {

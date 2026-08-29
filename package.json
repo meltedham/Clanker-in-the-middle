@@ -2,7 +2,7 @@
   "name": "volc-agent-launchpad",
   "version": "1.0.0",
   "private": true,
-  "description": "A middleware-free Agent platform starter kit running Codex CLI locally or on Volcengine ECS.",
+  "description": "An Agent platform running Codex CLI locally or on Volcengine ECS, extended with a Run reliability and observability middleware (see README.md#middleware).",
   "type": "module",
   "workspaces": [
     "apps/*"
@@ -14,7 +14,7 @@
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev -w @launchpad/server\" \"npm run dev -w @launchpad/web\"",
     "build": "npm run build -w @launchpad/web && npm run build -w @launchpad/server",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test -w @launchpad/server",
+    "test": "npm run test --workspaces --if-present",
     "check": "npm run typecheck && npm run test && npm run build",
     "poc": "./scripts/start-local-poc.sh",
     "start": "npm run start -w @launchpad/server"

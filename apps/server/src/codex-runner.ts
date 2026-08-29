@@ -5,7 +5,9 @@ import type { AppConfig } from "./config.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
+  ReconcileOutcome,
   RunUsage,
+  RunnerCallbacks,
   RunnerRequest,
   RunnerResult,
 } from "./types.js";
@@ -17,6 +19,34 @@ export interface ParsedEvents {
   threadId: string | null;
   usage: RunUsage | null;
   errors: string[];
+}
+
+/**
+ * Builds a reporter closure that calls `callbacks.onProgress` only when the
+ * thread id or the latest agent message actually changed since the last
+ * call, so streaming consumers can call it after every parsed chunk without
+ * re-sending unchanged state.
+ */
+export function createProgressReporter(
+  parsed: ParsedEvents,
+  callbacks?: RunnerCallbacks,
+): () => void {
+  let reportedThreadId: string | null = null;
+  let reportedMessageCount = 0;
+  return () => {
+    if (!callbacks?.onProgress) return;
+    const progress: { threadId?: string; message?: string } = {};
+    if (parsed.threadId && parsed.threadId !== reportedThreadId) {
+      reportedThreadId = parsed.threadId;
+      progress.threadId = parsed.threadId;
+    }
+    if (parsed.messages.length > reportedMessageCount) {
+      reportedMessageCount = parsed.messages.length;
+      const latest = parsed.messages.at(-1);
+      if (latest !== undefined) progress.message = latest;
+    }
+    if (progress.threadId || progress.message) callbacks.onProgress(progress);
+  };
 }
 
 export function buildCodexArgs(
@@ -124,7 +154,7 @@ export class CodexRunner implements AgentRunner {
     return true;
   }
 
-  async run(request: RunnerRequest): Promise<RunnerResult> {
+  async run(request: RunnerRequest, callbacks?: RunnerCallbacks): Promise<RunnerResult> {
     if (this.active.has(request.agentId)) {
       throw new Error("Agent already has an active Codex process");
     }
@@ -135,6 +165,7 @@ export class CodexRunner implements AgentRunner {
       env: this.childEnvironment(),
       stdio: ["ignore", "pipe", "pipe"],
     });
+    callbacks?.onHandle?.("pid:" + child.pid);
     const settled = new Promise<void>((resolve) => {
       child.once("close", () => resolve());
       child.once("error", () => resolve());
@@ -158,6 +189,7 @@ export class CodexRunner implements AgentRunner {
     let stdout = "";
     let stderr = "";
     let totalBytes = 0;
+    const reportProgress = createProgressReporter(parsed, callbacks);
 
     const consume = (chunk: Buffer, target: "stdout" | "stderr") => {
       totalBytes += chunk.byteLength;
@@ -173,6 +205,7 @@ export class CodexRunner implements AgentRunner {
         for (const line of lines) {
           parseCodexEventLine(line, parsed);
         }
+        reportProgress();
       } else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) {
@@ -197,6 +230,7 @@ export class CodexRunner implements AgentRunner {
       });
       if (stdout.trim()) {
         parseCodexEventLine(stdout.trim(), parsed);
+        reportProgress();
       }
       if (active.cancelled) {
         throw new RunCancelledError();
@@ -225,6 +259,22 @@ export class CodexRunner implements AgentRunner {
       if (active.forceKillTimer) clearTimeout(active.forceKillTimer);
       this.active.delete(request.agentId);
     }
+  }
+
+  /**
+   * Host-process Runs are children of this Node process. If this process
+   * restarted (crash, redeploy), the previous child was reaped along with
+   * it -- there is nothing to reattach to. This is a real limitation of the
+   * `local-process` runtime profile (see docs/reliability/01-solution-durable-run-reconciliation.md).
+   * Reconciliation therefore always reports the execution as gone; the
+   * caller is responsible for preserving whatever partial output/threadId
+   * had already been checkpointed via `onProgress` before that happened.
+   */
+  async reconcile(_agentId: string, _handle: string | null, _runId: string): Promise<ReconcileOutcome> {
+    return {
+      stillRunning: false,
+      reason: "Local-process Runs cannot be reattached after a server restart",
+    };
   }
 
   private terminate(active: {
