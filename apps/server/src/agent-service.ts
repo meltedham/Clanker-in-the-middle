@@ -18,7 +18,7 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 const countUsageTokens = (usage: RunUsage | null): number =>
-  (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+  (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
 
 const totalAgentTokens = (database: Database, agentId: string): number =>
   database.runs
@@ -65,8 +65,16 @@ export class AgentService {
         if (agent.tokenBudget === undefined) {
           agent.tokenBudget = null;
         }
+        if (agent.stopReason === undefined) {
+          const budgetExceeded =
+            agent.status === "stopped" &&
+            agent.tokenBudget !== null &&
+            totalAgentTokens(database, agent.id) >= agent.tokenBudget;
+          agent.stopReason = budgetExceeded ? "budget_exhausted" : null;
+        }
         if (agent.status === "busy") {
           agent.status = "ready";
+          agent.stopReason = null;
           agent.updatedAt = now();
         }
       }
@@ -97,6 +105,7 @@ export class AgentService {
       instructions: input.instructions?.trim() ?? "",
       tokenBudget: input.tokenBudget ?? null,
       status: "ready",
+      stopReason: null,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -124,8 +133,18 @@ export class AgentService {
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
-      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
-      agent.lastError = null;
+      if (input.tokenBudget !== undefined) {
+        agent.tokenBudget = input.tokenBudget;
+        const budgetAllowsRuns =
+          input.tokenBudget === null || totalAgentTokens(database, id) < input.tokenBudget;
+        if (agent.stopReason === "budget_exhausted" && budgetAllowsRuns) {
+          agent.status = "ready";
+          agent.stopReason = null;
+        }
+      }
+      agent.lastError = agent.stopReason === "budget_exhausted"
+        ? tokenBudgetExceededMessage
+        : null;
       agent.updatedAt = now();
       return structuredClone(agent);
     });
@@ -152,7 +171,7 @@ export class AgentService {
   async stopAgent(id: string): Promise<Agent> {
     this.getAgent(id);
     await this.cancelExecution(id);
-    return this.setStatus(id, "stopped");
+    return this.setStatus(id, "stopped", "manual");
   }
 
   async killAgent(id: string): Promise<Agent> {
@@ -165,6 +184,7 @@ export class AgentService {
         throw new HttpError(404, "Agent not found");
       }
       storedAgent.status = "stopped";
+      storedAgent.stopReason = "kill_switch";
       storedAgent.lastError = null;
       storedAgent.updatedAt = killedAt;
       return structuredClone(storedAgent);
@@ -293,6 +313,7 @@ export class AgentService {
         });
         database.messages.push(message, exhaustedNotice);
         storedAgent.status = "stopped";
+        storedAgent.stopReason = "budget_exhausted";
         storedAgent.lastError = tokenBudgetExceededMessage;
         storedAgent.updatedAt = timestamp;
         return structuredClone(storedAgent);
@@ -410,6 +431,7 @@ export class AgentService {
           createdAt: completedAt,
         });
         agent.status = budgetExceeded ? "stopped" : "ready";
+        agent.stopReason = budgetExceeded ? "budget_exhausted" : null;
         agent.codexThreadId = result.threadId;
         agent.lastError = budgetExceeded ? tokenBudgetExceededMessage : null;
         agent.updatedAt = completedAt;
@@ -437,7 +459,11 @@ export class AgentService {
     }
   }
 
-  private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
+  private async setStatus(
+    id: string,
+    status: Agent["status"],
+    stopReason: Agent["stopReason"] = null,
+  ): Promise<Agent> {
     return this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === id);
       if (!agent) {
@@ -447,6 +473,7 @@ export class AgentService {
         throw new HttpError(409, "Stop the active run before starting this Agent");
       }
       agent.status = status;
+      agent.stopReason = status === "stopped" ? stopReason : null;
       if (status === "ready") agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);

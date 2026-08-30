@@ -1,4 +1,5 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
+export type AgentStopReason = "budget_exhausted" | "manual" | "kill_switch";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface Agent {
@@ -8,6 +9,7 @@ export interface Agent {
   instructions: string;
   tokenBudget: number | null;
   status: AgentStatus;
+  stopReason: AgentStopReason | null;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
