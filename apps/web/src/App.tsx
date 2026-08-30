@@ -26,7 +26,7 @@ const emptyForm: AgentFormState = {
 };
 
 function countRunTokens(usage: AgentRun["usage"]): number {
-  return (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+  return (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
 }
 
 function formatTokenBudget(tokenBudget: number | null): string {
