@@ -6,6 +6,7 @@ export interface Agent {
   name: string;
   description: string;
   instructions: string;
+  tokenBudget: number | null;
   status: AgentStatus;
   workspacePath: string;
   codexThreadId: string | null;

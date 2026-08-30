@@ -7,6 +7,7 @@ export interface Agent {
   name: string;
   description: string;
   instructions: string;
+  tokenBudget: number | null;
   status: AgentStatus;
   workspacePath: string;
   codexThreadId: string | null;
@@ -54,18 +55,26 @@ export interface CreateAgentInput {
   name: string;
   description?: string | undefined;
   instructions?: string | undefined;
+  tokenBudget?: number | null | undefined;
 }
 
 export interface UpdateAgentInput {
   name?: string | undefined;
   description?: string | undefined;
   instructions?: string | undefined;
+  tokenBudget?: number | null | undefined;
 }
 
 export interface RunnerResult {
   output: string;
   threadId: string | null;
   usage: RunUsage | null;
+}
+
+export interface SendMessageResult {
+  run: AgentRun;
+  message: Message;
+  assistantMessage?: Message | undefined;
 }
 
 export interface RunnerRequest {

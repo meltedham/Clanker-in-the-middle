@@ -8,12 +8,45 @@ const starterPrompts = [
   "Build a responsive single-page todo app with tests.",
 ];
 
-const emptyForm = {
+type AgentFormState = {
+  name: string;
+  description: string;
+  instructions: string;
+  tokenBudgetMode: "unlimited" | "limited";
+  tokenBudgetValue: string;
+};
+
+const emptyForm: AgentFormState = {
   name: "",
   description: "",
   instructions:
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
+  tokenBudgetMode: "unlimited",
+  tokenBudgetValue: "",
 };
+
+function countRunTokens(usage: AgentRun["usage"]): number {
+  return (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+}
+
+function formatTokenBudget(tokenBudget: number | null): string {
+  return tokenBudget === null ? "Unlimited" : tokenBudget.toLocaleString() + " tokens";
+}
+
+function formatTokenCount(tokenCount: number): string {
+  return tokenCount.toLocaleString() + " tokens";
+}
+
+function resolveTokenBudget(form: AgentFormState): number | null {
+  if (form.tokenBudgetMode === "unlimited") {
+    return null;
+  }
+  const parsed = Number.parseInt(form.tokenBudgetValue, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("Token budget must be a positive whole number or set to unlimited.");
+  }
+  return parsed;
+}
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -39,6 +72,7 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [runs, setRuns] = useState<AgentRun[]>([]);
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -60,6 +94,21 @@ export default function App() {
     [agents, selectedId],
   );
 
+  const tokenUsage = useMemo(
+    () => runs.reduce((total, run) => total + countRunTokens(run.usage), 0),
+    [runs],
+  );
+
+  const tokenBudgetRemaining = useMemo(() => {
+    if (!selected || selected.tokenBudget === null) return null;
+    return Math.max(selected.tokenBudget - tokenUsage, 0);
+  }, [selected, tokenUsage]);
+
+  const tokenBudgetProgress = useMemo(() => {
+    if (!selected || selected.tokenBudget === null || selected.tokenBudget === 0) return 0;
+    return Math.min(100, (tokenUsage / selected.tokenBudget) * 100);
+  }, [selected, tokenUsage]);
+
   const refreshAgents = useCallback(async () => {
     const { agents: next } = await api.listAgents();
     setAgents(next);
@@ -75,6 +124,14 @@ export default function App() {
     if (mountedRef.current && selectedIdRef.current === agentId) {
       setMessages(result.messages);
     }
+  }, []);
+
+  const refreshRuns = useCallback(async (agentId: string) => {
+    const result = await api.runs(agentId);
+    if (mountedRef.current && selectedIdRef.current === agentId) {
+      setRuns(result.runs);
+    }
+    return result;
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -101,9 +158,10 @@ export default function App() {
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
+      setRuns([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
+    void Promise.all([refreshMessages(selectedId), refreshRuns(selectedId)])
       .then(([, result]) => {
         if (selectedIdRef.current !== selectedId) return;
         const latest = result.runs[0] ?? null;
@@ -117,7 +175,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, refreshRuns, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -125,6 +183,8 @@ export default function App() {
         name: selected.name,
         description: selected.description,
         instructions: selected.instructions,
+        tokenBudgetMode: selected.tokenBudget === null ? "unlimited" : "limited",
+        tokenBudgetValue: selected.tokenBudget === null ? "" : String(selected.tokenBudget),
       });
     }
   }, [selected]);
@@ -138,7 +198,12 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const { agent } = await api.createAgent(form);
+      const { agent } = await api.createAgent({
+        name: form.name,
+        description: form.description,
+        instructions: form.instructions,
+        tokenBudget: resolveTokenBudget(form),
+      });
       await refreshAgents();
       setSelectedId(agent.id);
       setShowCreate(false);
@@ -156,7 +221,12 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await api.updateAgent(selected.id, form);
+      await api.updateAgent(selected.id, {
+        name: form.name,
+        description: form.description,
+        instructions: form.instructions,
+        tokenBudget: resolveTokenBudget(form),
+      });
       await refreshAgents();
       setShowSettings(false);
     } catch (reason) {
@@ -177,6 +247,22 @@ export default function App() {
         await api.stopAgent(selected.id);
       }
       await refreshAgents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const killAgent = async () => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.killAgent(selected.id);
+      await refreshAgents();
+      await refreshMessages(selected.id);
+      setActiveRun(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -211,7 +297,7 @@ export default function App() {
         const result = await api.run(runId);
         if (selectedIdRef.current === agentId) setActiveRun(result.run);
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await Promise.all([refreshMessages(agentId), refreshRuns(agentId), refreshAgents()]);
           return;
         }
       }
@@ -223,23 +309,41 @@ export default function App() {
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!selected || !prompt.trim()) return;
+    if (selected.status === "busy" || (activeRun != null && ["queued", "running"].includes(activeRun.status))) {
+      setError("This Agent is still working on the previous message.");
+      return;
+    }
     const content = prompt.trim();
     setPrompt("");
     setError(null);
     try {
       const result = await api.sendMessage(selected.id, content);
       if (selectedIdRef.current === selected.id) {
-        setMessages((current) => [...current, result.message]);
+        setMessages((current) =>
+          result.assistantMessage
+            ? [...current, result.message, result.assistantMessage]
+            : [...current, result.message],
+        );
         setActiveRun(result.run);
+        setRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]);
       }
-      setAgents((current) =>
-        current.map((agent) =>
-          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
-        ),
-      );
-      await pollRun(result.run.id, selected.id);
+      if (["queued", "running"].includes(result.run.status)) {
+        setAgents((current) =>
+          current.map((agent) =>
+            agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+          ),
+        );
+        await pollRun(result.run.id, selected.id);
+      } else {
+        await refreshAgents();
+        await refreshMessages(selected.id);
+      }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (reason instanceof ApiError && reason.status === 409) {
+        setError(selected.lastError ?? "This Agent is still working on the previous message.");
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
       setActiveRun(null);
       await refreshAgents();
     }
@@ -401,6 +505,35 @@ export default function App() {
                   <StatusPill status={selected.status} />
                 </div>
                 <p>{selected.description || "A Codex coding Agent in an isolated workspace."}</p>
+                <p>Token budget: {formatTokenBudget(selected.tokenBudget)}</p>
+              </div>
+              {selected.lastError && (
+                <div className="agent-notice" role="status" aria-live="polite">
+                  <strong>Paused</strong>
+                  <span>{selected.lastError}</span>
+                </div>
+              )}
+              <div className="usage-card" aria-label="Token usage summary">
+                <div className="usage-card-header">
+                  <span className="eyebrow">Usage</span>
+                  <strong>
+                    {selected.tokenBudget === null ? "Unlimited" : `${Math.round(tokenBudgetProgress)}%`}
+                  </strong>
+                </div>
+                <div className="usage-meter" aria-hidden="true">
+                  <div
+                    className="usage-meter-fill"
+                    style={{ width: selected.tokenBudget === null ? "100%" : `${tokenBudgetProgress}%` }}
+                  />
+                </div>
+                <div className="usage-meta">
+                  <span>{formatTokenCount(tokenUsage)} used</span>
+                  <span>
+                    {selected.tokenBudget === null
+                      ? `${runs.length} runs logged`
+                      : `${formatTokenCount(tokenBudgetRemaining ?? 0)} remaining`}
+                  </span>
+                </div>
               </div>
               <div className="header-actions">
                 <button
@@ -417,6 +550,16 @@ export default function App() {
                 >
                   {selected.status === "stopped" ? "Start" : "Stop"}
                 </button>
+                {selected.status === "busy" && (
+                  <button
+                    className="button button-danger"
+                    onClick={killAgent}
+                    disabled={busy}
+                    title="Force-terminate the active run and clean up the workspace"
+                  >
+                    Kill switch
+                  </button>
+                )}
                 <button
                   className="button button-danger"
                   onClick={deleteAgent}
@@ -455,6 +598,49 @@ export default function App() {
                       }
                       maxLength={500}
                     />
+                  </label>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Token budget
+                    <select
+                      value={form.tokenBudgetMode}
+                      onChange={(event) =>
+                        setForm({
+                          ...form,
+                          tokenBudgetMode: event.target.value === "limited" ? "limited" : "unlimited",
+                        })
+                      }
+                    >
+                      <option value="unlimited">Unlimited</option>
+                      <option value="limited">Allocate tokens</option>
+                    </select>
+                  </label>
+                  <label>
+                    Budget amount
+                    <div
+                      className={
+                        "token-budget-shell " +
+                        (form.tokenBudgetMode === "unlimited" ? "token-budget-shell-disabled" : "")
+                      }
+                    >
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        inputMode="numeric"
+                        placeholder="50000"
+                        value={form.tokenBudgetValue}
+                        onChange={(event) =>
+                          setForm({ ...form, tokenBudgetValue: event.target.value })
+                        }
+                        disabled={form.tokenBudgetMode === "unlimited"}
+                        required={form.tokenBudgetMode === "limited"}
+                      />
+                      {form.tokenBudgetMode === "unlimited" && (
+                        <div className="token-budget-overlay">Locked while Unlimited is selected</div>
+                      )}
+                    </div>
                   </label>
                 </div>
                 <label>
@@ -536,6 +722,12 @@ export default function App() {
                   <article className="run-error">
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
+                  </article>
+                )}
+                {activeRun?.status === "cancelled" && (
+                  <article className="run-terminated">
+                    <strong>Run terminated</strong>
+                    <span>{activeRun.error ?? "Stopped by a control action."}</span>
                   </article>
                 )}
                 <div ref={messageEnd} />
@@ -639,6 +831,49 @@ export default function App() {
                 maxLength={500}
               />
             </label>
+            <div className="form-grid">
+              <label>
+                Token budget
+                <select
+                  value={form.tokenBudgetMode}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      tokenBudgetMode: event.target.value === "limited" ? "limited" : "unlimited",
+                    })
+                  }
+                >
+                  <option value="unlimited">Unlimited</option>
+                  <option value="limited">Allocate tokens</option>
+                </select>
+              </label>
+              <label>
+                Budget amount
+                <div
+                  className={
+                    "token-budget-shell " +
+                    (form.tokenBudgetMode === "unlimited" ? "token-budget-shell-disabled" : "")
+                  }
+                >
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    inputMode="numeric"
+                    placeholder="50000"
+                    value={form.tokenBudgetValue}
+                    onChange={(event) =>
+                      setForm({ ...form, tokenBudgetValue: event.target.value })
+                    }
+                    disabled={form.tokenBudgetMode === "unlimited"}
+                    required={form.tokenBudgetMode === "limited"}
+                  />
+                  {form.tokenBudgetMode === "unlimited" && (
+                    <div className="token-budget-overlay">Locked while Unlimited is selected</div>
+                  )}
+                </div>
+              </label>
+            </div>
             <label>
               Instructions
               <textarea

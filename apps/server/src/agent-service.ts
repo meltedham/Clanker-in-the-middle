@@ -8,12 +8,36 @@ import type {
   AgentRun,
   AgentRunner,
   CreateAgentInput,
+  Database,
   Message,
+  RunUsage,
+  SendMessageResult,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+const countUsageTokens = (usage: RunUsage | null): number =>
+  (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+
+const totalAgentTokens = (database: Database, agentId: string): number =>
+  database.runs
+    .filter((run) => run.agentId === agentId)
+    .reduce((total, run) => total + countUsageTokens(run.usage), 0);
+
+const tokenBudgetExceededMessage =
+  "Token usage is up. Agent paused until the budget is increased or set to unlimited.";
+const agentBusyMessage =
+  "This Agent is still working on the previous message. Please wait for it to finish.";
+
+const dangerousPromptPatterns = [
+  /\brm\s+-rf\b/i,
+  /\bdelete\s+everything\s+in\s+the\s+repo\b/i,
+  /\bwipe\s+(?:the\s+)?(?:workspace|repo|project|directory)\b/i,
+  /\bshutdown\b|\breboot\b|\bpoweroff\b/i,
+  /\bmkfs\b|\bdd\s+if=/i,
+  /\b(?:curl|wget)\b.*\|\s*(?:bash|sh)/i,
+];
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -38,6 +62,9 @@ export class AgentService {
         }
       }
       for (const agent of database.agents) {
+        if (agent.tokenBudget === undefined) {
+          agent.tokenBudget = null;
+        }
         if (agent.status === "busy") {
           agent.status = "ready";
           agent.updatedAt = now();
@@ -68,6 +95,7 @@ export class AgentService {
       name: input.name.trim(),
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
+      tokenBudget: input.tokenBudget ?? null,
       status: "ready",
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
@@ -96,6 +124,7 @@ export class AgentService {
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -126,6 +155,22 @@ export class AgentService {
     return this.setStatus(id, "stopped");
   }
 
+  async killAgent(id: string): Promise<Agent> {
+    this.getAgent(id);
+    void this.cancelExecution(id).catch(() => undefined);
+    const killedAt = now();
+    return this.store.mutate((database) => {
+      const storedAgent = database.agents.find((item) => item.id === id);
+      if (!storedAgent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      storedAgent.status = "stopped";
+      storedAgent.lastError = null;
+      storedAgent.updatedAt = killedAt;
+      return structuredClone(storedAgent);
+    });
+  }
+
   getMessages(agentId: string): Message[] {
     this.getAgent(agentId);
     return this.store
@@ -153,7 +198,23 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
-  ): Promise<{ run: AgentRun; message: Message }> {
+  ): Promise<SendMessageResult> {
+    const normalizedPrompt = prompt.trim();
+    if (normalizedPrompt.length === 0) {
+      throw new HttpError(400, "Prompt cannot be empty");
+    }
+    if (normalizedPrompt.length > this.config.maxPromptChars) {
+      throw new HttpError(
+        400,
+        `Prompt exceeds the maximum length of ${this.config.maxPromptChars} characters`,
+      );
+    }
+    if (dangerousPromptPatterns.some((pattern) => pattern.test(normalizedPrompt))) {
+      throw new HttpError(
+        400,
+        "Prompt blocked by the runaway-execution safety policy.",
+      );
+    }
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
         503,
@@ -166,7 +227,7 @@ export class AgentService {
       id: runId,
       agentId,
       status: "queued",
-      prompt,
+      prompt: normalizedPrompt,
       output: null,
       error: null,
       usage: null,
@@ -182,16 +243,87 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
+    let exhaustedRun: AgentRun | null = null;
+    let exhaustedNotice: Message | null = null;
+    let busyRun: AgentRun | null = null;
+    let busyNotice: Message | null = null;
+    const budgetNotice = (completedAt: string): Message => ({
+      id: randomUUID(),
+      agentId,
+      runId,
+      role: "assistant",
+      content: tokenBudgetExceededMessage,
+      createdAt: completedAt,
+    });
+    const busyReply = (completedAt: string): Message => ({
+      id: randomUUID(),
+      agentId,
+      runId,
+      role: "assistant",
+      content: agentBusyMessage,
+      createdAt: completedAt,
+    });
     const agentAtStart = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === agentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
       }
-      if (storedAgent.status === "stopped") {
-        throw new HttpError(409, "Start the Agent before sending a message");
+      const budgetExceeded =
+        storedAgent.tokenBudget !== null &&
+        totalAgentTokens(database, agentId) >= storedAgent.tokenBudget;
+      if (budgetExceeded) {
+        exhaustedNotice = budgetNotice(timestamp);
+        exhaustedRun = {
+          ...run,
+          status: "completed",
+          output: tokenBudgetExceededMessage,
+          error: null,
+          usage: null,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        };
+        database.runs.push({
+          ...run,
+          status: "completed",
+          output: tokenBudgetExceededMessage,
+          error: null,
+          usage: null,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        });
+        database.messages.push(message, exhaustedNotice);
+        storedAgent.status = "stopped";
+        storedAgent.lastError = tokenBudgetExceededMessage;
+        storedAgent.updatedAt = timestamp;
+        return structuredClone(storedAgent);
       }
       if (storedAgent.status === "busy") {
-        throw new HttpError(409, "This Agent is already running");
+        busyNotice = busyReply(timestamp);
+        busyRun = {
+          ...run,
+          status: "completed",
+          output: agentBusyMessage,
+          error: null,
+          usage: null,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        };
+        database.runs.push({
+          ...run,
+          status: "completed",
+          output: agentBusyMessage,
+          error: null,
+          usage: null,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        });
+        database.messages.push(message, busyNotice);
+        storedAgent.lastError = agentBusyMessage;
+        storedAgent.updatedAt = timestamp;
+        return structuredClone(storedAgent);
+      }
+      if (storedAgent.status === "stopped") {
+        throw new HttpError(409, "Start the Agent before sending a message");
       }
       database.runs.push(run);
       database.messages.push(message);
@@ -201,6 +333,12 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
+    if (exhaustedRun && exhaustedNotice) {
+      return { run: exhaustedRun, message, assistantMessage: exhaustedNotice };
+    }
+    if (busyRun && busyNotice) {
+      return { run: busyRun, message, assistantMessage: busyNotice };
+    }
     const execution = this.executeRun(agentAtStart, run);
     this.activeExecutions.set(agentId, execution);
     void execution
@@ -255,6 +393,10 @@ export class AgentService {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (!storedRun || !agent) return;
+        const completedTokens = countUsageTokens(result.usage);
+        const totalTokens = totalAgentTokens(database, agent.id) + completedTokens;
+        const budgetExceeded =
+          agent.tokenBudget !== null && totalTokens >= agent.tokenBudget;
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
@@ -267,9 +409,9 @@ export class AgentService {
           content: result.output,
           createdAt: completedAt,
         });
-        agent.status = "ready";
+        agent.status = budgetExceeded ? "stopped" : "ready";
         agent.codexThreadId = result.threadId;
-        agent.lastError = null;
+        agent.lastError = budgetExceeded ? tokenBudgetExceededMessage : null;
         agent.updatedAt = completedAt;
       });
     } catch (error) {

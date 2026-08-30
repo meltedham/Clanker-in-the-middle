@@ -40,6 +40,7 @@ export const api = {
     name: string;
     description: string;
     instructions: string;
+    tokenBudget: number | null;
   }) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
@@ -47,7 +48,7 @@ export const api = {
     }),
   updateAgent: (
     id: string,
-    body: { name: string; description: string; instructions: string },
+    body: { name: string; description: string; instructions: string; tokenBudget: number | null },
   ) =>
     request<{ agent: Agent }>("/api/agents/" + id, {
       method: "PATCH",
@@ -65,12 +66,16 @@ export const api = {
     request<{ agent: Agent }>("/api/agents/" + id + "/stop", {
       method: "POST",
     }),
+  killAgent: (id: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/kill", {
+      method: "POST",
+    }),
   messages: (id: string) =>
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
   sendMessage: (id: string, content: string) =>
-    request<{ run: AgentRun; message: Message }>(
+    request<{ run: AgentRun; message: Message; assistantMessage?: Message }>(
       "/api/agents/" + id + "/messages",
       {
         method: "POST",

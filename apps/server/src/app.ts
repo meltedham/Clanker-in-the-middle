@@ -10,10 +10,12 @@ import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const tokenBudgetField = z.number().int().positive().nullable().optional();
 const createAgentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
+  tokenBudget: tokenBudgetField,
 });
 const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
@@ -104,6 +106,11 @@ export async function createApp(
   app.post("/api/agents/:id/stop", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { agent: await service.stopAgent(id) };
+  });
+
+  app.post("/api/agents/:id/kill", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { agent: await service.killAgent(id) };
   });
 
   app.get("/api/agents/:id/messages", async (request) => {
