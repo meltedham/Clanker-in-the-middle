@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
 import {
@@ -33,9 +34,13 @@ describe("Container Codex runner", () => {
     );
     expect(args).toContain("runtime:test");
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
-    expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
+    expect(args).toContain("type=bind,src=" + path.resolve("/tmp/codex-home") + ",dst=/codex-home");
     expect(args).toContain("501:20");
     expect(args).toContain("workspace-write");
+    expect(args).toContain("--read-only");
+    expect(args).toContain("/tmp:rw,nosuid,nodev,noexec,size=256m");
+    expect(args).toContain("/run:rw,nosuid,nodev,noexec,size=32m");
+    expect(args).toContain("/var/tmp:rw,nosuid,nodev,noexec,size=32m");
     expect(args).toContain("/workspace");
     expect(args).toContain("io.codejam.instance-id=test-instance");
     expect(args).toContain("keep-id");

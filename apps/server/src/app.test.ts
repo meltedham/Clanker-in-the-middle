@@ -6,6 +6,7 @@ import type { AgentService } from "./agent-service.js";
 const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
+  killAgent: async () => ({})
 } as unknown as AgentService;
 
 describe("HTTP boundary", () => {
@@ -43,6 +44,17 @@ describe("HTTP boundary", () => {
       payload: JSON.stringify({ name: "x".repeat(1_100_000) }),
     });
     expect(oversized.statusCode).toBe(413);
+    await app.close();
+  });
+
+  it("exposes the kill switch route", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), {
+      listAgents: () => [],
+      systemInfo: async () => ({}),
+      killAgent: async () => ({ id: "agent", status: "stopped" }),
+    } as unknown as AgentService);
+    const response = await app.inject({ method: "POST", url: "/api/agents/00000000-0000-0000-0000-000000000000/kill" });
+    expect(response.statusCode).toBe(200);
     await app.close();
   });
 });
