@@ -100,6 +100,7 @@ export const api = {
     name: string;
     description: string;
     instructions: string;
+    tokenBudget: number | null;
   }) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
@@ -111,6 +112,7 @@ export const api = {
       name: string;
       description: string;
       instructions: string;
+      tokenBudget: number | null;
       // Only ever sent when the caller can see the runtime-policy controls
       // (owner/admin) -- AgentService still re-checks this itself either way.
       sandboxMode?: SandboxMode;
@@ -131,6 +133,10 @@ export const api = {
     }),
   stopAgent: (id: string) =>
     request<{ agent: Agent }>("/api/agents/" + id + "/stop", {
+      method: "POST",
+    }),
+  killAgent: (id: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/kill", {
       method: "POST",
     }),
   messages: (id: string) =>
@@ -175,7 +181,12 @@ export const api = {
       method: "DELETE",
     }),
   sendMessage: (id: string, content: string) =>
-    request<{ run: AgentRun; message: Message; retrieval: AgentRun["retrieval"] }>(
+    request<{
+      run: AgentRun;
+      message: Message;
+      assistantMessage?: Message;
+      retrieval: AgentRun["retrieval"];
+    }>(
       "/api/agents/" + id + "/messages",
       {
         method: "POST",

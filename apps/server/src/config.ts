@@ -60,6 +60,7 @@ const envSchema = z.object({
   // never call POST /api/users to keep the single-user baseline (or the
   // legacy shared APP_AUTH_TOKEN) unchanged.
   APP_USERS: z.string().trim().optional(),
+  MAX_PROMPT_CHARS: z.coerce.number().int().min(1_000).default(20_000),
   OPENROUTER_BASE_URL: z
     .string()
     .url()
@@ -147,6 +148,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     openRouterEmbeddingModel: env.OPENROUTER_EMBEDDING_MODEL?.trim() ?? "",
     sharedResourceRoot: path.resolve(env.SHARED_RESOURCE_ROOT),
     users,
+    maxPromptChars: env.MAX_PROMPT_CHARS,
     nodeEnv: env.NODE_ENV,
     ragTopK: 8,
     ragChunkSize: 1_200,

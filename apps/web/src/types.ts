@@ -8,6 +8,7 @@ export interface Agent {
   name: string;
   description: string;
   instructions: string;
+  tokenBudget: number | null;
   status: AgentStatus;
   ownerId: string;
   sandboxMode: SandboxMode;

@@ -12,7 +12,7 @@ import {
   parseDelegation,
 } from "./delegation.js";
 import type { AgentCreationRequest } from "./delegation.js";
-import { HttpError, RunCancelledError } from "./errors.js";
+import { AgentBusyError, HttpError, RunCancelledError, TokenBudgetExceededError } from "./errors.js";
 import { RagService } from "./rag/rag-service.js";
 import { normalizeUploadContent, type UploadInput } from "./rag/upload-content.js";
 import { JsonStore } from "./store.js";
@@ -23,6 +23,7 @@ import type {
   AgentRunner,
   AuthUser,
   CreateAgentInput,
+  Database,
   EffectiveRole,
   Grant,
   GrantRole,
@@ -30,8 +31,10 @@ import type {
   Message,
   RagContext,
   RagSummary,
+  RunUsage,
   RunnerCallbacks,
   RunnerResult,
+  SendMessageResult,
   UpdateAgentInput,
   UserRole,
 } from "./types.js";
@@ -39,6 +42,27 @@ import { UNCLAIMED_OWNER_ID } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+const countUsageTokens = (usage: RunUsage | null): number =>
+  (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+
+const totalAgentTokens = (database: Database, agentId: string): number =>
+  database.runs
+    .filter((run) => run.agentId === agentId)
+    .reduce((total, run) => total + countUsageTokens(run.usage), 0);
+
+const tokenBudgetExceededMessage =
+  "Token usage is up. Agent paused until the budget is increased or set to unlimited.";
+const agentBusyMessage =
+  "This Agent is still working on the previous message. Please wait for it to finish.";
+
+const dangerousPromptPatterns = [
+  /\brm\s+-rf\b/i,
+  /\bdelete\s+everything\s+in\s+the\s+repo\b/i,
+  /\bwipe\s+(?:the\s+)?(?:workspace|repo|project|directory)\b/i,
+  /\bshutdown\b|\breboot\b|\bpoweroff\b/i,
+  /\bmkfs\b|\bdd\s+if=/i,
+  /\b(?:curl|wget)\b.*\|\s*(?:bash|sh)/i,
+];
 
 type IterationOutcome = { kind: "final" } | { kind: "continue"; nextPrompt: string };
 type FinalizeOutcome =
@@ -237,6 +261,9 @@ export class AgentService {
     await this.store.mutate((database) => {
       const validSandboxModes = ["read-only", "workspace-write"];
       for (const agent of database.agents) {
+        if (agent.tokenBudget === undefined) {
+          agent.tokenBudget = null;
+        }
         if (agent.status === "busy") {
           agent.status = "ready";
           agent.updatedAt = now();
@@ -621,6 +648,7 @@ export class AgentService {
       name: input.name.trim(),
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
+      tokenBudget: input.tokenBudget ?? null,
       status: "ready",
       ownerId,
       sandboxMode: input.sandboxMode ?? this.config.codexSandboxMode,
@@ -671,6 +699,7 @@ export class AgentService {
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
       if (input.sandboxMode !== undefined) agent.sandboxMode = input.sandboxMode;
       if (input.networkAccess !== undefined) agent.networkAccess = input.networkAccess;
+      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -759,6 +788,34 @@ export class AgentService {
     return this.setStatus(id, "stopped");
   }
 
+  /**
+   * A harder stop than `stopAgent`: forces the Agent to "stopped" and
+   * clears its error immediately, without waiting for cancellation to
+   * actually finish (fire-and-forget) -- a panic button for when the
+   * underlying runner might be hung. Still cascades to any in-flight
+   * delegated child via `cancelExecution`, and is gated the same as
+   * `stopAgent` (owner/admin only) since it's equally destructive to
+   * whatever someone else may have had running.
+   */
+  async killAgent(id: string, actor: AuthUser | null = null): Promise<Agent> {
+    const current = this.getAgent(id, actor, "write");
+    if (!this.isOwnerOrAdmin(current, actor)) {
+      throw new HttpError(403, "Only the Agent's owner or an admin can force-stop it");
+    }
+    void this.cancelExecution(id).catch(() => undefined);
+    const killedAt = now();
+    return this.store.mutate((database) => {
+      const storedAgent = database.agents.find((item) => item.id === id);
+      if (!storedAgent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      storedAgent.status = "stopped";
+      storedAgent.lastError = null;
+      storedAgent.updatedAt = killedAt;
+      return structuredClone(storedAgent);
+    });
+  }
+
   getMessages(agentId: string, actor: AuthUser | null = null): Message[] {
     this.getAgent(agentId, actor, "read");
     return this.store
@@ -788,7 +845,7 @@ export class AgentService {
     agentId: string,
     prompt: string,
     actor: AuthUser | null = null,
-  ): Promise<{ run: AgentRun; message: Message; retrieval: RagSummary }> {
+  ): Promise<SendMessageResult> {
     // Checked before any other precondition so a denied caller always sees
     // 403, never a hint about the platform's own configuration state (e.g.
     // whether OpenRouter is set up). Sending a message is a write: a
@@ -800,7 +857,20 @@ export class AgentService {
         "OpenRouter is not configured. Set OPENROUTER_API_KEY and OPENROUTER_MODEL, then restart.",
       );
     }
-    const { run, message, agentAtStart, ragContext } = await this.createRunAtomic(agentId, prompt, null);
+    const outcome = await this.createRunAtomic(agentId, prompt, null);
+    if (outcome.kind === "short-circuited") {
+      // The Agent is over its token budget or already mid-run -- a real,
+      // completed Run + assistant reply was still persisted (visible in
+      // history like any other exchange), just without ever calling the
+      // runner.
+      return {
+        run: outcome.run,
+        message: outcome.message,
+        assistantMessage: outcome.assistantMessage,
+        retrieval: emptyRetrievalSummary(),
+      };
+    }
+    const { run, message, agentAtStart, ragContext } = outcome;
     const execution = this.executeRun(agentAtStart, run, ragContext);
     this.trackExecution(agentId, execution);
     return { run, message, retrieval: ragContext.summary };
@@ -862,19 +932,37 @@ export class AgentService {
     targetAgentId: string,
     prompt: string,
     parentRunId: string | null,
-  ): Promise<{
-    run: AgentRun;
-    message: Message;
-    agentAtStart: Agent;
-    ragContext: Pick<RagContext, "prompt" | "summary">;
-  }> {
+  ): Promise<
+    | {
+        kind: "started";
+        run: AgentRun;
+        message: Message;
+        agentAtStart: Agent;
+        ragContext: Pick<RagContext, "prompt" | "summary">;
+      }
+    | { kind: "short-circuited"; run: AgentRun; message: Message; assistantMessage: Message }
+  > {
+    const normalizedPrompt = prompt.trim();
+    if (normalizedPrompt.length === 0) {
+      throw new HttpError(400, "Prompt cannot be empty");
+    }
+    if (normalizedPrompt.length > this.config.maxPromptChars) {
+      throw new HttpError(
+        400,
+        `Prompt exceeds the maximum length of ${this.config.maxPromptChars} characters`,
+      );
+    }
+    if (dangerousPromptPatterns.some((pattern) => pattern.test(normalizedPrompt))) {
+      throw new HttpError(400, "Prompt blocked by the runaway-execution safety policy.");
+    }
+
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
       id: runId,
       agentId: targetAgentId,
       status: "queued",
-      prompt,
+      prompt: normalizedPrompt,
       output: null,
       error: null,
       usage: null,
@@ -893,19 +981,69 @@ export class AgentService {
       agentId: targetAgentId,
       runId,
       role: "user",
-      content: prompt,
+      content: normalizedPrompt,
       createdAt: timestamp,
     };
-    const agentAtStart = await this.store.mutate((database) => {
+
+    type MutateResult =
+      | { kind: "short-circuited"; run: AgentRun; assistantMessage: Message }
+      | { kind: "started"; agentAtStart: Agent };
+
+    const result: MutateResult = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === targetAgentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
       }
-      if (storedAgent.status === "stopped") {
-        throw new HttpError(409, "Start the Agent before sending a message");
+      const budgetExceeded =
+        storedAgent.tokenBudget !== null &&
+        totalAgentTokens(database, targetAgentId) >= storedAgent.tokenBudget;
+      if (budgetExceeded) {
+        const completedRun: AgentRun = {
+          ...run,
+          status: "completed",
+          output: tokenBudgetExceededMessage,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        };
+        const assistantMessage: Message = {
+          id: randomUUID(),
+          agentId: targetAgentId,
+          runId,
+          role: "assistant",
+          content: tokenBudgetExceededMessage,
+          createdAt: timestamp,
+        };
+        database.runs.push(completedRun);
+        database.messages.push(message, assistantMessage);
+        storedAgent.status = "stopped";
+        storedAgent.lastError = tokenBudgetExceededMessage;
+        storedAgent.updatedAt = timestamp;
+        return { kind: "short-circuited", run: completedRun, assistantMessage };
       }
       if (storedAgent.status === "busy") {
-        throw new HttpError(409, "This Agent is already running");
+        const completedRun: AgentRun = {
+          ...run,
+          status: "completed",
+          output: agentBusyMessage,
+          startedAt: timestamp,
+          completedAt: timestamp,
+        };
+        const assistantMessage: Message = {
+          id: randomUUID(),
+          agentId: targetAgentId,
+          runId,
+          role: "assistant",
+          content: agentBusyMessage,
+          createdAt: timestamp,
+        };
+        database.runs.push(completedRun);
+        database.messages.push(message, assistantMessage);
+        storedAgent.lastError = agentBusyMessage;
+        storedAgent.updatedAt = timestamp;
+        return { kind: "short-circuited", run: completedRun, assistantMessage };
+      }
+      if (storedAgent.status === "stopped") {
+        throw new HttpError(409, "Start the Agent before sending a message");
       }
       database.runs.push(run);
       database.messages.push(message);
@@ -917,15 +1055,24 @@ export class AgentService {
         const storedParent = database.runs.find((item) => item.id === parentRunId);
         if (storedParent) storedParent.awaitingChildRunId = run.id;
       }
-      return snapshot;
+      return { kind: "started", agentAtStart: snapshot };
     });
+
+    if (result.kind === "short-circuited") {
+      return {
+        kind: "short-circuited",
+        run: result.run,
+        message,
+        assistantMessage: result.assistantMessage,
+      };
+    }
 
     let ragContext: RagContext;
     try {
-      ragContext = await this.ragService.buildContext(agentAtStart, prompt, runId);
+      ragContext = await this.ragService.buildContext(result.agentAtStart, normalizedPrompt, runId);
     } catch {
       ragContext = {
-        prompt,
+        prompt: normalizedPrompt,
         matches: [],
         summary: emptyRetrievalSummary(),
       };
@@ -938,7 +1085,7 @@ export class AgentService {
       }
     });
 
-    return { run, message, agentAtStart, ragContext };
+    return { kind: "started", run, message, agentAtStart: result.agentAtStart, ragContext };
   }
 
   private trackExecution(agentId: string, execution: Promise<void>): void {
@@ -963,17 +1110,24 @@ export class AgentService {
    * asking another for help), so it deliberately never checks `actor`
    * access -- the top-level user request that started the parent Run
    * already passed that check once.
+   *
+   * If the target turns out to be busy or over its token budget in the
+   * narrow race window after `validateDelegationTarget` already checked it,
+   * `createRunAtomic` still returns a real, persisted "short-circuited" Run
+   * (never throws for these two cases) -- that reads to the caller exactly
+   * like an ordinary completed delegation whose answer happens to be a
+   * busy/budget notice, so no special-casing is needed here either.
    */
   private async delegateToAgent(
     parentRun: AgentRun,
     targetAgent: Agent,
     task: string,
   ): Promise<AgentRun> {
-    const { run: childRun, agentAtStart, ragContext } = await this.createRunAtomic(
-      targetAgent.id,
-      task,
-      parentRun.id,
-    );
+    const outcome = await this.createRunAtomic(targetAgent.id, task, parentRun.id);
+    if (outcome.kind === "short-circuited") {
+      return outcome.run;
+    }
+    const { run: childRun, agentAtStart, ragContext } = outcome;
     const execution = this.executeRun(agentAtStart, childRun, ragContext);
     this.trackExecution(targetAgent.id, execution);
     await execution;
@@ -1213,6 +1367,12 @@ export class AgentService {
         const agent = database.agents.find((item) => item.id === agentId);
         if (!storedRun || !agent) return;
         const output = this.redactOutput(outcome.result.output, agent.workspacePath);
+        // Computed before storedRun.usage is overwritten below, so this
+        // Run's own tokens are counted exactly once (totalAgentTokens sums
+        // over database.runs, which doesn't yet reflect this completion).
+        const completedTokens = countUsageTokens(outcome.result.usage);
+        const totalTokens = totalAgentTokens(database, agent.id) + completedTokens;
+        const budgetExceeded = agent.tokenBudget !== null && totalTokens >= agent.tokenBudget;
         storedRun.status = "completed";
         storedRun.output = output;
         storedRun.usage = outcome.result.usage;
@@ -1227,9 +1387,9 @@ export class AgentService {
           content: output,
           createdAt: completedAt,
         });
-        agent.status = "ready";
+        agent.status = budgetExceeded ? "stopped" : "ready";
         agent.codexThreadId = outcome.result.threadId;
-        agent.lastError = null;
+        agent.lastError = budgetExceeded ? tokenBudgetExceededMessage : null;
         agent.updatedAt = completedAt;
       });
       return;
@@ -1349,6 +1509,16 @@ export class AgentService {
         );
       } catch (error) {
         await this.finalizeRun(runId, agentId, { kind: "error", error });
+        return;
+      }
+      // Re-checked here, not just at the top of the loop: a kill/stop
+      // requested while this exact runner.run() call was already in
+      // flight would otherwise go unnoticed once it resolves successfully
+      // -- the caller explicitly asked to abort, so a late-arriving result
+      // must still finalize as cancelled, not be presented as a normal
+      // completion.
+      if (this.cancellationRequests.has(agentId)) {
+        await this.finalizeRun(runId, agentId, { kind: "error", error: new RunCancelledError() });
         return;
       }
       // Always the thread this call actually used/produced -- never the

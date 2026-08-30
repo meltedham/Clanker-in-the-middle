@@ -144,6 +144,14 @@ describe("Agent lifecycle", () => {
     expect(service.listAgents()).toHaveLength(0);
   });
 
+  it("persists and updates an Agent token budget", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Budget", tokenBudget: 100 });
+
+    expect(service.getAgent(agent.id).tokenBudget).toBe(100);
+    expect((await service.updateAgent(agent.id, { tokenBudget: null })).tokenBudget).toBeNull();
+  });
+
   it("persists a playground conversation", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Coder" });
@@ -179,7 +187,7 @@ describe("Agent lifecycle", () => {
     expect(assistantMessage?.content).toContain("uid [redacted]");
   });
 
-  it("atomically accepts only one concurrent run per Agent", async () => {
+  it("only lets one of two concurrent sends actually run -- the other gets a graceful 'please wait' reply", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {
       finish = resolve;
@@ -192,24 +200,29 @@ describe("Agent lifecycle", () => {
     };
     const service = await makeService(runner);
     const agent = await service.createAgent({ name: "Concurrent" });
-    const attempts = await Promise.allSettled([
+    // Both calls are made synchronously, so "first" always enters the
+    // store's serialized mutation queue before "second" does -- ties are
+    // not possible here.
+    const [first, second] = await Promise.all([
       service.sendMessage(agent.id, "first"),
       service.sendMessage(agent.id, "second"),
     ]);
 
-    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
-    const rejected = attempts.find((attempt) => attempt.status === "rejected");
-    expect(rejected).toMatchObject({ reason: { statusCode: 409 } });
-    expect(service.getMessages(agent.id)).toHaveLength(1);
+    expect(first.assistantMessage).toBeUndefined();
+    expect(["queued", "running"]).toContain(first.run.status);
+    expect(second.assistantMessage?.content).toContain("still working");
+    expect(second.run.status).toBe("completed");
+    // The short-circuited "second" exchange is still real, persisted
+    // history -- not silently dropped.
+    expect(service.getMessages(agent.id).map((message) => message.content)).toContain(
+      second.assistantMessage?.content,
+    );
 
     finish({ output: "done", threadId: "thread", usage: null });
-    const accepted = attempts.find((attempt) => attempt.status === "fulfilled");
-    if (accepted?.status === "fulfilled") {
-      await expect.poll(() => service.getRun(accepted.value.run.id).status).toBe("completed");
-    }
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
   });
 
-  it("does not let start reset a busy Agent and admit a second run", async () => {
+  it("does not let start reset a busy Agent, and replies gracefully instead of double-running a second message", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {
       finish = resolve;
@@ -224,12 +237,48 @@ describe("Agent lifecycle", () => {
     const { run } = await service.sendMessage(agent.id, "first");
 
     await expect(service.startAgent(agent.id)).rejects.toMatchObject({ statusCode: 409 });
-    await expect(service.sendMessage(agent.id, "second")).rejects.toMatchObject({
-      statusCode: 409,
-    });
+    const second = await service.sendMessage(agent.id, "second");
+    expect(second.assistantMessage?.content).toContain("still working");
+    expect(second.run.status).toBe("completed");
 
     finish({ output: "done", threadId: "thread", usage: null });
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+  });
+
+  it("force-kills a busy Agent immediately", async () => {
+    let finish!: (result: RunnerResult) => void;
+    const pending = new Promise<RunnerResult>((resolve) => {
+      finish = resolve;
+    });
+    const service = await makeService({
+      run: () => pending,
+      cancel: async () => true,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Kill" });
+    const { run } = await service.sendMessage(agent.id, "first");
+
+    const killed = await service.killAgent(agent.id);
+    expect(killed.status).toBe("stopped");
+
+    await expect.poll(() => service.getAgent(agent.id).status).toBe("stopped");
+    finish({ output: "done", threadId: "thread", usage: null });
+    await expect.poll(() => service.getRun(run.id).status).toBe("cancelled");
+  });
+
+  it("blocks new runs after the token budget is exhausted", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Quota", tokenBudget: 10 });
+
+    await service.sendMessage(agent.id, "first run");
+    await expect.poll(() => service.getRuns(agent.id)[0]?.status).toBe("completed");
+    await expect.poll(() => service.getAgent(agent.id).status).toBe("stopped");
+    expect(service.getAgent(agent.id).lastError).toContain("Token usage is up");
+
+    const result = await service.sendMessage(agent.id, "second run");
+    expect(result.run.status).toBe("completed");
+    expect(result.assistantMessage?.content).toContain("Token usage is up");
+    expect(service.getMessages(agent.id).at(-1)?.content).toContain("Token usage is up");
   });
 });
 
@@ -1111,5 +1160,37 @@ describe("Runtime policy back-compat", () => {
     // hardcoded string -- proving it reads real config, not a guess.
     expect(agent.sandboxMode).toBe("read-only");
     expect(agent.networkAccess).toBe(true);
+  });
+});
+
+describe("Prompt safety gate", () => {
+  it("rejects oversized prompts before a run starts", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Safety" });
+    const oversized = "x".repeat(20_001);
+
+    await expect(service.sendMessage(agent.id, oversized)).rejects.toMatchObject({
+      statusCode: 400,
+    });
+  });
+
+  it("rejects prompts with destructive shell patterns before a run starts", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Safety" });
+
+    await expect(service.sendMessage(agent.id, "rm -rf / && echo pwned")).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    await expect(service.sendMessage(agent.id, "delete everything in the repo")).rejects.toMatchObject({
+      statusCode: 400,
+    });
+  });
+
+  it("allows normal prompts through the safety gate", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Safe" });
+    const { run } = await service.sendMessage(agent.id, "write a small hello world app");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getMessages(agent.id)).toHaveLength(2);
   });
 });

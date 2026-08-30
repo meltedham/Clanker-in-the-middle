@@ -95,6 +95,7 @@ export interface Agent {
   name: string;
   description: string;
   instructions: string;
+  tokenBudget: number | null;
   status: AgentStatus;
   ownerId: string;
   sandboxMode: SandboxMode;
@@ -174,6 +175,7 @@ export interface CreateAgentInput {
   instructions?: string | undefined;
   sandboxMode?: SandboxMode | undefined;
   networkAccess?: boolean | undefined;
+  tokenBudget?: number | null | undefined;
 }
 
 export interface UpdateAgentInput {
@@ -182,12 +184,20 @@ export interface UpdateAgentInput {
   instructions?: string | undefined;
   sandboxMode?: SandboxMode | undefined;
   networkAccess?: boolean | undefined;
+  tokenBudget?: number | null | undefined;
 }
 
 export interface RunnerResult {
   output: string;
   threadId: string | null;
   usage: RunUsage | null;
+}
+
+export interface SendMessageResult {
+  run: AgentRun;
+  message: Message;
+  assistantMessage?: Message | undefined;
+  retrieval: RagSummary;
 }
 
 export interface RunnerRequest {

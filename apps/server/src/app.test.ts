@@ -64,6 +64,7 @@ const service = {
       matchCount: 1,
     },
   }),
+  killAgent: async () => ({}),
 } as unknown as AgentService;
 
 const emptyTrace: TraceReader = { read: async () => [] };
@@ -199,6 +200,26 @@ describe("HTTP boundary", () => {
     };
     expect(payload.retrieval?.status).toBe("moderate");
     expect(payload.retrieval?.confidence).toBeCloseTo(0.6);
+    await app.close();
+  });
+
+  it("exposes the kill switch route", async () => {
+    const app = await createApp(
+      loadConfig({ NODE_ENV: "test" }),
+      {
+        listAgents: () => [],
+        systemInfo: async () => ({}),
+        hasIdentityEnabled: () => false,
+        resolveUserByToken: () => null,
+        killAgent: async () => ({ id: "agent", status: "stopped" }),
+      } as unknown as AgentService,
+      emptyTrace,
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agents/00000000-0000-0000-0000-000000000000/kill",
+    });
+    expect(response.statusCode).toBe(200);
     await app.close();
   });
 });
