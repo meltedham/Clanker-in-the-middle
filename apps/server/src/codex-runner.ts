@@ -116,6 +116,11 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
   }
 }
 
+/** Runs Codex as a host process (RUNTIME_PROVIDER=local-process). Note:
+ * there is no container boundary here, so `request.networkAccess` cannot be
+ * enforced by this Runtime -- only ContainerCodexRunner can actually cut
+ * network access. sandboxMode is still enforced, since that's Codex's own
+ * flag, independent of the process/container boundary. */
 export class CodexRunner implements AgentRunner {
   private readonly active = new Map<
     string,
@@ -159,7 +164,9 @@ export class CodexRunner implements AgentRunner {
       throw new Error("Agent already has an active Codex process");
     }
 
-    const args = buildCodexArgs(request, this.config.codexSandboxMode);
+    // Per-Agent, not the platform-wide default: each Agent carries its own
+    // sandbox policy, set at creation or edited by its owner/admin.
+    const args = buildCodexArgs(request, request.sandboxMode);
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
       env: this.childEnvironment(),

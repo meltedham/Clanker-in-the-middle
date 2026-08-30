@@ -139,10 +139,12 @@ fi
 if [[ "$codex_sandbox_mode" == "workspace-write" ]] \
   && ! "$engine" run --rm "$runtime_image" \
     codex sandbox linux --full-auto -- true >/dev/null 2>&1; then
-  log "Codex Landlock is unavailable in this Linux Runtime."
-  log "Falling back to danger-full-access inside the disposable container boundary."
-  log "Do not mount unrelated secrets or host directories into the Agent Runtime."
-  codex_sandbox_mode=danger-full-access
+  log "Codex Landlock is unavailable in this Linux Runtime, so the platform's"
+  log "per-Agent sandbox boundary cannot be enforced. Refusing to start rather"
+  log "than silently running Agents with unrestricted filesystem access."
+  log "Use a host/kernel with Landlock support (Linux 5.13+), or a container"
+  log "engine whose VM kernel supports it (current Docker Desktop and Colima do)."
+  exit 3
 fi
 
 export NODE_ENV=production

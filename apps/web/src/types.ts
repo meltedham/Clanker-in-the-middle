@@ -1,5 +1,7 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type SandboxMode = "read-only" | "workspace-write";
+export type EffectiveRole = "owner" | "admin" | "viewer" | "operator";
 
 export interface Agent {
   id: string;
@@ -7,11 +9,18 @@ export interface Agent {
   description: string;
   instructions: string;
   status: AgentStatus;
+  ownerId: string;
+  sandboxMode: SandboxMode;
+  networkAccess: boolean;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+  // Computed per-request server-side: your own relationship to this
+  // specific Agent, not stored data. null only when no identity exists at
+  // all (single-user baseline).
+  myRole: EffectiveRole | null;
 }
 
 export interface Message {

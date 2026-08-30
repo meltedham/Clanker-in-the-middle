@@ -1,4 +1,12 @@
-import type { Agent, AgentRun, Message, ResourceSummary, RunEvent, SystemInfo } from "./types";
+import type {
+  Agent,
+  AgentRun,
+  Message,
+  ResourceSummary,
+  RunEvent,
+  SandboxMode,
+  SystemInfo,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -25,15 +33,67 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     ...options,
     headers,
   });
-  const data = (await response.json().catch(() => ({}))) as T & { error?: string };
+  const data = (await response.json().catch(() => ({}))) as T & {
+    error?: string;
+    message?: string;
+  };
   if (!response.ok) {
-    throw new ApiError(data.error ?? "Request failed", response.status);
+    // The server's custom error handler sends `{error: "<specific reason>"}`.
+    // A Fastify-plugin quirk under NODE_ENV=production instead sends the
+    // default `{statusCode, error: "<generic HTTP reason phrase>", message:
+    // "<specific reason>"}` for some routes -- `message`, when present, is
+    // always the more specific one, so prefer it.
+    throw new ApiError(data.message ?? data.error ?? "Request failed", response.status);
   }
   return data;
 }
 
+export type UserRole = "admin" | "member";
+export type GrantRole = "viewer" | "operator";
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  role: UserRole;
+}
+
+// Every admin appears here too, as a synthetic entry with revocable:false --
+// they have full access to every Agent regardless of any Grant, so there's
+// nothing to revoke.
+export interface Grant {
+  id: string;
+  userId: string;
+  userName: string;
+  role: GrantRole | "admin";
+  revocable: boolean;
+  createdAt: string;
+}
+
 export const api = {
-  auth: () => request<{ required: boolean }>("/api/auth"),
+  auth: () => request<{ required: boolean; identityEnabled: boolean }>("/api/auth"),
+  whoami: () => request<{ user: AuthUser | null }>("/api/whoami"),
+  listUsers: () => request<{ users: Array<{ id: string; name: string }> }>("/api/users"),
+  createUser: (name: string, options?: { role?: UserRole; password?: string }) =>
+    request<{ user: AuthUser; token: string }>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ name, ...options }),
+    }),
+  login: (name: string, password: string) =>
+    request<{ user: AuthUser; token: string }>("/api/login", {
+      method: "POST",
+      body: JSON.stringify({ name, password }),
+    }),
+  listGrants: (agentId: string) =>
+    request<{ grants: Grant[] }>("/api/agents/" + agentId + "/grants"),
+  createGrant: (agentId: string, userId: string, role: GrantRole) =>
+    request<{ grant: Grant }>("/api/agents/" + agentId + "/grants", {
+      method: "POST",
+      body: JSON.stringify({ userId, role }),
+    }),
+  revokeGrant: (agentId: string, grantId: string) =>
+    request<void>("/api/agents/" + agentId + "/grants/" + grantId, {
+      method: "DELETE",
+    }),
   system: () => request<SystemInfo>("/api/system"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
@@ -47,7 +107,15 @@ export const api = {
     }),
   updateAgent: (
     id: string,
-    body: { name: string; description: string; instructions: string },
+    body: {
+      name: string;
+      description: string;
+      instructions: string;
+      // Only ever sent when the caller can see the runtime-policy controls
+      // (owner/admin) -- AgentService still re-checks this itself either way.
+      sandboxMode?: SandboxMode;
+      networkAccess?: boolean;
+    },
   ) =>
     request<{ agent: Agent }>("/api/agents/" + id, {
       method: "PATCH",

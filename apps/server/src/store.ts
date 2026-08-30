@@ -7,6 +7,8 @@ const emptyDatabase = (): Database => ({
   agents: [],
   messages: [],
   runs: [],
+  users: [],
+  grants: [],
 });
 
 export class JsonStore {
@@ -35,6 +37,24 @@ export class JsonStore {
         if (typeof record.orchestrationIterationCount === "undefined") {
           record.orchestrationIterationCount = 0;
         }
+      }
+      // Back-compat: databases written before user identity existed have no
+      // `users` array yet.
+      if (!Array.isArray(parsed.users)) {
+        parsed.users = [];
+      }
+      // Back-compat: databases written before roles existed have users with
+      // no `role` field. Default to "member" -- never silently upgrade a
+      // pre-existing account to admin.
+      for (const user of parsed.users) {
+        if (user.role !== "admin" && user.role !== "member") {
+          user.role = "member";
+        }
+      }
+      // Back-compat: databases written before Grants existed have no
+      // `grants` array yet.
+      if (!Array.isArray(parsed.grants)) {
+        parsed.grants = [];
       }
       this.data = parsed;
     } catch (error) {

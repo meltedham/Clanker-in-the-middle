@@ -12,6 +12,8 @@ describe("Codex runner protocol", () => {
         workspacePath: "/tmp/workspace",
         prompt: "build a calculator",
         threadId: null,
+        sandboxMode: "workspace-write",
+        networkAccess: true,
       },
       "workspace-write",
     );
@@ -35,6 +37,8 @@ describe("Codex runner protocol", () => {
         workspacePath: "/tmp/workspace",
         prompt: "add tests",
         threadId: "thread-123",
+        sandboxMode: "workspace-write",
+        networkAccess: true,
       },
       "workspace-write",
     );

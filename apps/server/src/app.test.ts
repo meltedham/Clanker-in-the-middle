@@ -8,6 +8,9 @@ import type { TraceReader } from "./middleware/trace-store.js";
 const service = {
   listAgents: () => [],
   systemInfo: async () => ({}),
+  hasIdentityEnabled: () => false,
+  resolveUserByToken: () => null,
+  listUsers: () => [],
   listUploads: async () => [],
   uploadAgentResource: async (
     _agentId: string,
@@ -109,6 +112,8 @@ describe("HTTP boundary", () => {
     const traceService = {
       listAgents: () => [],
       systemInfo: async () => ({}),
+      hasIdentityEnabled: () => false,
+      resolveUserByToken: () => null,
       getRun: (id: string) => ({ id, agentId: "agent-1", status: "completed" }),
     } as unknown as AgentService;
     const traceReader: TraceReader = {
@@ -135,6 +140,8 @@ describe("HTTP boundary", () => {
     const traceService = {
       listAgents: () => [],
       systemInfo: async () => ({}),
+      hasIdentityEnabled: () => false,
+      resolveUserByToken: () => null,
       getRun: () => {
         throw new HttpError(404, "Run not found");
       },

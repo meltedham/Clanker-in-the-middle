@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isModelProviderConfigured } from "./config.js";
 import {
@@ -20,14 +20,21 @@ import type {
   Agent,
   AgentRun,
   AgentRunner,
+  AuthUser,
   CreateAgentInput,
+  EffectiveRole,
+  Grant,
+  GrantRole,
+  GrantView,
   Message,
   RagContext,
   RagSummary,
   RunnerCallbacks,
   RunnerResult,
   UpdateAgentInput,
+  UserRole,
 } from "./types.js";
+import { UNCLAIMED_OWNER_ID } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
@@ -36,6 +43,90 @@ type IterationOutcome = { kind: "final" } | { kind: "continue"; nextPrompt: stri
 type FinalizeOutcome =
   | { kind: "success"; result: RunnerResult }
   | { kind: "error"; error: unknown };
+type AccessLevel = "read" | "write";
+
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function hashesMatch(candidateHash: string, storedHash: string): boolean {
+  const candidateBuffer = Buffer.from(candidateHash);
+  const storedBuffer = Buffer.from(storedHash);
+  return (
+    candidateBuffer.length === storedBuffer.length &&
+    timingSafeEqual(candidateBuffer, storedBuffer)
+  );
+}
+
+// scrypt, not sha256: a token is already a random 24-byte value with no
+// guessable structure, so a fast hash is fine for it. A password is
+// low-entropy and human-chosen, so it needs a deliberately slow, salted KDF
+// to resist offline brute-forcing of a leaked store.
+function hashPassword(password: string): string {
+  const salt = randomBytes(16).toString("hex");
+  const derived = scryptSync(password, salt, 64).toString("hex");
+  return salt + ":" + derived;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  const [salt, derivedHex] = stored.split(":");
+  if (!salt || !derivedHex) return false;
+  const candidate = scryptSync(password, salt, 64);
+  const storedBuffer = Buffer.from(derivedHex, "hex");
+  return candidate.length === storedBuffer.length && timingSafeEqual(candidate, storedBuffer);
+}
+
+/**
+ * `actor` is `null` whenever no identity is configured (no user has ever
+ * been created), which preserves the original single-user baseline
+ * behavior -- it's also how every internal/system call (boot reconciliation,
+ * delegation's own roster lookups, etc.) reaches this, since those aren't
+ * acting on behalf of any particular end user. Once identity is active,
+ * every Agent-scoped operation reachable from an HTTP route is checked here
+ * against, in order: admin bypass, ownership, then any active (non-revoked)
+ * Grant. A "viewer" Grant only ever satisfies "read"; only "operator" (or
+ * ownership/admin) satisfies "write". This is re-checked on every call, so
+ * revoking a Grant takes effect on the very next request -- there is no
+ * caching of a previously-resolved permission.
+ */
+function assertAccess(
+  agent: Agent,
+  actor: AuthUser | null,
+  level: AccessLevel,
+  grants: Grant[],
+): void {
+  if (actor === null) return;
+  if (actor.role === "admin") return;
+  if (agent.ownerId === actor.id) return;
+  const activeGrant = grants.find(
+    (grant) => grant.agentId === agent.id && grant.userId === actor.id && !grant.revokedAt,
+  );
+  if (activeGrant && (level === "read" || activeGrant.role === "operator")) return;
+  if (activeGrant) {
+    // They do have access -- just not enough of it. Distinct from having
+    // none at all, so a viewer trying to write isn't told they have no
+    // access when they actually have read access.
+    throw new HttpError(
+      403,
+      "You have read-only access to this Agent; this action requires write access",
+    );
+  }
+  throw new HttpError(403, "You do not have access to this Agent");
+}
+
+/** Same precedence as assertAccess (admin, then owner, then Grant), but
+ * returns the answer instead of throwing -- used to tell the caller what
+ * their own relationship to an Agent actually is, e.g. so the UI can show
+ * "you have read-only access" on an Agent shared with them. */
+function myRoleFor(agent: Agent, actor: AuthUser | null, grants: Grant[]): EffectiveRole | null {
+  if (actor === null) return null;
+  if (actor.role === "admin") return "admin";
+  if (agent.ownerId === actor.id) return "owner";
+  const activeGrant = grants.find(
+    (grant) => grant.agentId === agent.id && grant.userId === actor.id && !grant.revokedAt,
+  );
+  return activeGrant ? activeGrant.role : null;
+}
 
 /**
  * Control Plane: Agent specification, validation, status, Run
@@ -53,6 +144,13 @@ type FinalizeOutcome =
  * or create+await a child Run and resume with its result -- entirely inside
  * this class. The runner/tracing layers never know delegation exists; every
  * loop iteration is just another ordinary `AgentRunner.run()` call.
+ *
+ * Identity and access control: `actor` (an `AuthUser`, or `null` for
+ * internal/system calls and the single-user baseline) flows through every
+ * Agent-scoped public method and is checked via `assertAccess`/
+ * `isOwnerOrAdmin`. Enforcement only activates once `hasIdentityEnabled()`
+ * is true -- i.e. once at least one user exists in the store, seeded or
+ * self-registered.
  */
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -136,12 +234,257 @@ export class AgentService {
     }
 
     await this.store.mutate((database) => {
+      const validSandboxModes = ["read-only", "workspace-write"];
       for (const agent of database.agents) {
         if (agent.status === "busy") {
           agent.status = "ready";
           agent.updatedAt = now();
         }
+        // Back-compat: Agents created before per-Agent runtime policy
+        // existed have neither field in their stored JSON. Backfill to
+        // what they were already implicitly running as -- the platform's
+        // one global default at the time -- rather than leaving them
+        // `undefined`, which a <select> in the UI would otherwise render
+        // as its first option ("read-only") despite nothing actually
+        // being set.
+        if (!validSandboxModes.includes(agent.sandboxMode)) {
+          agent.sandboxMode = this.config.codexSandboxMode;
+        }
+        if (typeof agent.networkAccess !== "boolean") {
+          agent.networkAccess = true;
+        }
       }
+      for (const seed of this.config.users) {
+        const tokenHash = hashToken(seed.token);
+        const existing = database.users.find((user) => user.id === seed.id);
+        if (existing) {
+          existing.name = seed.name;
+          existing.tokenHash = tokenHash;
+          existing.role = seed.role;
+        } else {
+          database.users.push({
+            id: seed.id,
+            name: seed.name,
+            tokenHash,
+            role: seed.role,
+            createdAt: now(),
+          });
+        }
+      }
+    });
+  }
+
+  /** True once any user exists (seeded via APP_USERS or self-registered).
+   * Ownership enforcement in this service only activates once this is true,
+   * which preserves the single-user baseline until a team opts in. */
+  hasIdentityEnabled(): boolean {
+    return this.store.snapshot().users.length > 0;
+  }
+
+  /** Whether `actor` may manage (grant/revoke/view grants for, or create a
+   * user pre-granted onto) `agent`: the owner, an admin, or -- only while
+   * identity has never been activated -- anyone. `actor === null` while
+   * identity IS active (only reachable through the one intentionally
+   * unauthenticated caller of this: POST /api/users with no token) must
+   * NOT be treated as a bypass, unlike the read/write access check above,
+   * or an anonymous caller could grant themselves access to any Agent. */
+  private isOwnerOrAdmin(agent: Agent, actor: AuthUser | null): boolean {
+    if (!this.hasIdentityEnabled()) return true;
+    if (!actor) return false;
+    return actor.role === "admin" || agent.ownerId === actor.id;
+  }
+
+  listUsers(): Array<{ id: string; name: string }> {
+    return this.store
+      .snapshot()
+      .users.map((user) => ({ id: user.id, name: user.name }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async createUser(
+    name: string,
+    options: {
+      actor?: AuthUser | null | undefined;
+      role?: UserRole | undefined;
+      password?: string | undefined;
+    } = {},
+  ): Promise<{ user: AuthUser; token: string }> {
+    const { actor = null, role: requestedRole, password } = options;
+
+    const token = randomBytes(24).toString("base64url");
+    const tokenHash = hashToken(token);
+    const passwordHash = password ? hashPassword(password) : undefined;
+    const id = randomUUID();
+    const createdAt = now();
+
+    const role = await this.store.mutate((database) => {
+      // Login-by-name only works if a name is unambiguous among
+      // password-holding accounts; passwordless accounts (e.g. seeded via
+      // APP_USERS) are unaffected and may still share a name.
+      if (passwordHash && database.users.some((user) => user.passwordHash && user.name === name)) {
+        throw new HttpError(409, `An account named "${name}" already has a password set`);
+      }
+      const isFirstEver = database.users.length === 0;
+      let effectiveRole: UserRole = "member";
+      if (isFirstEver) {
+        // Bootstrap: the very first account on a fresh instance becomes
+        // admin automatically, so identity can activate without needing a
+        // pre-existing admin to invite anyone.
+        effectiveRole = "admin";
+      } else if (requestedRole === "admin") {
+        if (actor?.role !== "admin") {
+          throw new HttpError(403, "Only an existing admin can create another admin");
+        }
+        effectiveRole = "admin";
+      }
+      database.users.push({
+        id,
+        name,
+        tokenHash,
+        ...(passwordHash ? { passwordHash } : {}),
+        role: effectiveRole,
+        createdAt,
+      });
+      return effectiveRole;
+    });
+
+    return { user: { id, name, role }, token };
+  }
+
+  /** Verifies name+password and mints a fresh token for that account,
+   * replacing whatever token it had before (single active session per
+   * account -- logging in elsewhere invalidates the previous token). Only
+   * accounts created with a password can use this; a generic 401 either way
+   * avoids confirming whether a given name exists. */
+  async login(name: string, password: string): Promise<{ user: AuthUser; token: string }> {
+    const trimmedName = name.trim();
+    const token = randomBytes(24).toString("base64url");
+    const tokenHash = hashToken(token);
+    return this.store.mutate((database) => {
+      const user = database.users.find(
+        (entry) => entry.passwordHash && entry.name === trimmedName,
+      );
+      if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
+        throw new HttpError(401, "Invalid name or password");
+      }
+      user.tokenHash = tokenHash;
+      return { user: { id: user.id, name: user.name, role: user.role }, token };
+    });
+  }
+
+  /** Looks up the caller from a bearer token. Returns null on no match so
+   * the route boundary can turn that into a 401 without leaking which part
+   * of the credential was wrong. */
+  resolveUserByToken(token: string): AuthUser | null {
+    if (!token) return null;
+    const candidateHash = hashToken(token);
+    const user = this.store
+      .snapshot()
+      .users.find((entry) => hashesMatch(candidateHash, entry.tokenHash));
+    return user ? { id: user.id, name: user.name, role: user.role } : null;
+  }
+
+  /** Grant scoped, revocable access to one Agent. Upserts: re-granting an
+   * existing (non-revoked) Grant for the same Agent/user just changes its
+   * role rather than creating a duplicate. */
+  async createGrant(
+    agentId: string,
+    actor: AuthUser | null,
+    granteeUserId: string,
+    role: GrantRole,
+  ): Promise<Grant> {
+    return this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (!this.isOwnerOrAdmin(agent, actor)) {
+        throw new HttpError(
+          403,
+          "Only the Agent's owner or an admin can manage its access grants",
+        );
+      }
+      const grantee = database.users.find((user) => user.id === granteeUserId);
+      if (!grantee) throw new HttpError(404, "User not found");
+      if (grantee.role === "admin") {
+        // Admins bypass ownership unconditionally in assertAccess, before
+        // any Grant is even consulted -- a Grant record here would do
+        // nothing except lie in the Active Grants list, implying an admin
+        // is restricted to "viewer" when they still have full access.
+        throw new HttpError(
+          403,
+          "Admins already have full access to every Agent and can't be granted a role",
+        );
+      }
+      const existing = database.grants.find(
+        (item) => item.agentId === agentId && item.userId === granteeUserId && !item.revokedAt,
+      );
+      if (existing) {
+        existing.role = role;
+        return structuredClone(existing);
+      }
+      const grant: Grant = {
+        id: randomUUID(),
+        agentId,
+        userId: granteeUserId,
+        role,
+        createdAt: now(),
+        revokedAt: null,
+      };
+      database.grants.push(grant);
+      return structuredClone(grant);
+    });
+  }
+
+  /** Everyone who effectively has access to this Agent, owner/admin-only:
+   * every admin (a synthetic, non-revocable entry -- they bypass Grants
+   * entirely, so there is nothing to revoke), plus every active (non-
+   * revoked) explicit Grant. Admins are listed first since their access
+   * isn't tied to this Agent specifically. */
+  listGrants(agentId: string, actor: AuthUser | null): GrantView[] {
+    const snapshot = this.store.snapshot();
+    const agent = snapshot.agents.find((item) => item.id === agentId);
+    if (!agent) throw new HttpError(404, "Agent not found");
+    if (!this.isOwnerOrAdmin(agent, actor)) {
+      throw new HttpError(403, "Only the Agent's owner or an admin can view its access grants");
+    }
+    const adminEntries: GrantView[] = snapshot.users
+      .filter((user) => user.role === "admin")
+      .map((user) => ({
+        id: "admin:" + user.id,
+        userId: user.id,
+        userName: user.name,
+        role: "admin",
+        revocable: false,
+        createdAt: user.createdAt,
+      }));
+    const grantEntries: GrantView[] = snapshot.grants
+      .filter((grant) => grant.agentId === agentId && !grant.revokedAt)
+      .map((grant) => ({
+        id: grant.id,
+        userId: grant.userId,
+        userName: snapshot.users.find((user) => user.id === grant.userId)?.name ?? "Unknown",
+        role: grant.role,
+        revocable: true,
+        createdAt: grant.createdAt,
+      }));
+    return [...adminEntries, ...grantEntries];
+  }
+
+  /** Revocation takes effect immediately: the very next request that relies
+   * on this Grant re-reads the store and finds `revokedAt` set, since
+   * `assertAccess` never caches a previous decision. */
+  async revokeGrant(agentId: string, grantId: string, actor: AuthUser | null): Promise<void> {
+    await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) throw new HttpError(404, "Agent not found");
+      if (!this.isOwnerOrAdmin(agent, actor)) {
+        throw new HttpError(
+          403,
+          "Only the Agent's owner or an admin can revoke its access grants",
+        );
+      }
+      const grant = database.grants.find((item) => item.id === grantId && item.agentId === agentId);
+      if (!grant) throw new HttpError(404, "Grant not found");
+      grant.revokedAt = now();
     });
   }
 
@@ -227,21 +570,39 @@ export class AgentService {
     };
   }
 
-  listAgents(): Agent[] {
-    return this.store
-      .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  listAgents(actor: AuthUser | null = null): Array<Agent & { myRole: EffectiveRole | null }> {
+    const snapshot = this.store.snapshot();
+    const withRole = (agent: Agent) => ({
+      ...agent,
+      myRole: myRoleFor(agent, actor, snapshot.grants),
+    });
+    if (actor === null || actor.role === "admin") {
+      return snapshot.agents
+        .map(withRole)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    }
+    const grantedAgentIds = new Set(
+      snapshot.grants
+        .filter((grant) => grant.userId === actor.id && !grant.revokedAt)
+        .map((grant) => grant.agentId),
+    );
+    return snapshot.agents
+      .filter((agent) => agent.ownerId === actor.id || grantedAgentIds.has(agent.id))
+      .map(withRole)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  getAgent(id: string): Agent {
-    const agent = this.store.snapshot().agents.find((item) => item.id === id);
+  getAgent(id: string, actor: AuthUser | null = null, level: AccessLevel = "read"): Agent {
+    const snapshot = this.store.snapshot();
+    const agent = snapshot.agents.find((item) => item.id === id);
     if (!agent) {
       throw new HttpError(404, "Agent not found");
     }
+    assertAccess(agent, actor, level, snapshot.grants);
     return agent;
   }
 
-  async createAgent(input: CreateAgentInput): Promise<Agent> {
+  async createAgent(input: CreateAgentInput, ownerId: string = UNCLAIMED_OWNER_ID): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
     const agent: Agent = {
@@ -250,6 +611,9 @@ export class AgentService {
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
       status: "ready",
+      ownerId,
+      sandboxMode: input.sandboxMode ?? this.config.codexSandboxMode,
+      networkAccess: input.networkAccess ?? true,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -261,22 +625,41 @@ export class AgentService {
     return agent;
   }
 
-  async updateAgent(id: string, input: UpdateAgentInput): Promise<Agent> {
-    const current = this.getAgent(id);
+  async updateAgent(
+    id: string,
+    input: UpdateAgentInput,
+    actor: AuthUser | null = null,
+  ): Promise<Agent> {
+    const current = this.getAgent(id, actor, "write");
     if (current.status === "busy") {
       throw new HttpError(409, "Stop the active run before editing this Agent");
+    }
+    // Runtime policy (sandbox/network) is stricter than ordinary edits: an
+    // operator Grant lets someone use an Agent, not reconfigure how
+    // dangerous it's allowed to be. Only the owner or an admin may change it.
+    if (
+      (input.sandboxMode !== undefined || input.networkAccess !== undefined) &&
+      !this.isOwnerOrAdmin(current, actor)
+    ) {
+      throw new HttpError(
+        403,
+        "Only the Agent's owner or an admin can change its sandbox or network policy",
+      );
     }
     const updated = await this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === id);
       if (!agent) {
         throw new HttpError(404, "Agent not found");
       }
+      assertAccess(agent, actor, "write", database.grants);
       if (agent.status === "busy") {
         throw new HttpError(409, "Stop the active run before editing this Agent");
       }
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      if (input.sandboxMode !== undefined) agent.sandboxMode = input.sandboxMode;
+      if (input.networkAccess !== undefined) agent.networkAccess = input.networkAccess;
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -285,14 +668,26 @@ export class AgentService {
     return updated;
   }
 
-  async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
-    const agent = this.getAgent(id);
+  async deleteAgent(
+    id: string,
+    actor: AuthUser | null = null,
+  ): Promise<{ archivedWorkspace: string }> {
+    const agent = this.getAgent(id, actor, "write");
+    // Stricter than an ordinary write, same reasoning as stopAgent:
+    // deleting is destructive and irreversible (the workspace is archived,
+    // the Agent is gone). An operator Grant lets someone use the Agent,
+    // not destroy it out from under its owner -- only the owner or an
+    // admin can.
+    if (!this.isOwnerOrAdmin(agent, actor)) {
+      throw new HttpError(403, "Only the Agent's owner or an admin can delete it");
+    }
     await this.cancelExecution(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
       database.messages = database.messages.filter((item) => item.agentId !== id);
       database.runs = database.runs.filter((item) => item.agentId !== id);
+      database.grants = database.grants.filter((item) => item.agentId !== id);
     });
     return { archivedWorkspace };
   }
@@ -312,53 +707,66 @@ export class AgentService {
     await this.sharedResources.delete(name);
   }
 
-  async listUploads(agentId: string): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
-    this.getAgent(agentId);
+  async listUploads(
+    agentId: string,
+    actor: AuthUser | null = null,
+  ): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
+    this.getAgent(agentId, actor, "read");
     return this.workspaces.listUploads(agentId);
   }
 
   async uploadAgentResource(
     agentId: string,
     input: UploadInput,
+    actor: AuthUser | null = null,
   ): Promise<{ name: string; size: number; updatedAt: string }> {
-    this.getAgent(agentId);
+    this.getAgent(agentId, actor, "write");
     const content = (await normalizeUploadContent(input)).trim();
     return this.workspaces.writeUpload(agentId, input.name, content);
   }
 
-  async deleteAgentUpload(agentId: string, name: string): Promise<void> {
-    this.getAgent(agentId);
+  async deleteAgentUpload(agentId: string, name: string, actor: AuthUser | null = null): Promise<void> {
+    this.getAgent(agentId, actor, "write");
     await this.workspaces.deleteUpload(agentId, name);
   }
 
-  async startAgent(id: string): Promise<Agent> {
+  async startAgent(id: string, actor: AuthUser | null = null): Promise<Agent> {
+    this.getAgent(id, actor, "write");
     return this.setStatus(id, "ready");
   }
 
-  async stopAgent(id: string): Promise<Agent> {
-    this.getAgent(id);
+  async stopAgent(id: string, actor: AuthUser | null = null): Promise<Agent> {
+    const current = this.getAgent(id, actor, "write");
+    // Stricter than an ordinary write: stopping kills whatever is actually
+    // running, possibly work someone else started. An operator Grant can
+    // use the Agent, but not interrupt it out from under its owner --
+    // only the owner or an admin can.
+    if (!this.isOwnerOrAdmin(current, actor)) {
+      throw new HttpError(403, "Only the Agent's owner or an admin can stop it");
+    }
     await this.cancelExecution(id);
     return this.setStatus(id, "stopped");
   }
 
-  getMessages(agentId: string): Message[] {
-    this.getAgent(agentId);
+  getMessages(agentId: string, actor: AuthUser | null = null): Message[] {
+    this.getAgent(agentId, actor, "read");
     return this.store
       .snapshot()
       .messages.filter((message) => message.agentId === agentId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  getRun(runId: string): AgentRun {
+  getRun(runId: string, actor: AuthUser | null = null): AgentRun {
     const run = this.store.snapshot().runs.find((item) => item.id === runId);
     if (!run) {
       throw new HttpError(404, "Run not found");
     }
+    this.getAgent(run.agentId, actor, "read");
     return run;
   }
 
-  getRuns(agentId: string): AgentRun[] {
-    this.getAgent(agentId);
+  getRuns(agentId: string, actor: AuthUser | null = null): AgentRun[] {
+    this.getAgent(agentId, actor, "read");
     return this.store
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
@@ -368,7 +776,13 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
+    actor: AuthUser | null = null,
   ): Promise<{ run: AgentRun; message: Message; retrieval: RagSummary }> {
+    // Checked before any other precondition so a denied caller always sees
+    // 403, never a hint about the platform's own configuration state (e.g.
+    // whether OpenRouter is set up). Sending a message is a write: a
+    // "viewer" Grant is not enough, only "operator" (or ownership/admin).
+    this.getAgent(agentId, actor, "write");
     if (!isModelProviderConfigured(this.config)) {
       throw new HttpError(
         503,
@@ -398,6 +812,28 @@ export class AgentService {
           ? "Codex CLI in " + this.config.containerEngine + " Runtime"
           : "Codex CLI in application container",
     };
+  }
+
+  /** Best-effort redaction of internal infrastructure details before
+   * Codex's own freeform text (or a raw error message) is ever persisted or
+   * shown to a user. Codex runs real shell commands against the real
+   * filesystem, so its own responses can quote absolute host paths,
+   * container UIDs, etc. verbatim -- this can't catch every way an LLM
+   * might phrase a leak, only the exact, known strings this service
+   * itself controls, but that reliably covers what every Run actually
+   * exposes: this Agent's own workspace path, the shared workspace root,
+   * Codex's home directory, and raw uid/gid numbers. Applied going
+   * forward only -- it does not retroactively rewrite already-stored
+   * messages. */
+  private redactOutput(text: string, agentWorkspacePath: string): string {
+    return text
+      .split(agentWorkspacePath)
+      .join("[agent workspace path redacted]")
+      .split(this.config.workspaceRoot)
+      .join("[workspace root redacted]")
+      .split(this.config.codexHome)
+      .join("[codex home redacted]")
+      .replace(/\b(uid|gid)[=:\s]+\d+/gi, "$1 [redacted]");
   }
 
   /**
@@ -512,7 +948,10 @@ export class AgentService {
    * further) is fully crash-resilient on its own, with zero special-casing.
    * A child can itself be an orchestrator; recursion is bounded by
    * `MAX_DELEGATION_DEPTH`, enforced in `validateDelegationTarget` before
-   * this is ever called.
+   * this is ever called. This is an internal, system-driven Run (one Agent
+   * asking another for help), so it deliberately never checks `actor`
+   * access -- the top-level user request that started the parent Run
+   * already passed that check once.
    */
   private async delegateToAgent(
     parentRun: AgentRun,
@@ -639,7 +1078,11 @@ export class AgentService {
   ): Promise<IterationOutcome> {
     const creationRequests = parseAgentCreation(result.output);
     if (creationRequests) {
-      const summary = await this.handleAgentCreation(creationRequests);
+      // Sub-agents spawned by an orchestrator inherit its owner, so the
+      // user who owns the orchestrator still has (and only they have, once
+      // identity is active) management access to whatever it spins up.
+      const ownerId = this.getAgent(agentId).ownerId;
+      const summary = await this.handleAgentCreation(creationRequests, ownerId);
       return { kind: "continue", nextPrompt: summary };
     }
 
@@ -685,7 +1128,7 @@ export class AgentService {
    * next prompt; never throws -- a per-item failure is reported in the
    * summary instead of aborting the whole batch.
    */
-  private async handleAgentCreation(requests: AgentCreationRequest[]): Promise<string> {
+  private async handleAgentCreation(requests: AgentCreationRequest[], ownerId: string): Promise<string> {
     const capped = requests.slice(0, MAX_AGENTS_PER_CREATE_BLOCK);
     const overflow = requests.length - capped.length;
     const created: string[] = [];
@@ -700,11 +1143,14 @@ export class AgentService {
         continue;
       }
       try {
-        await this.createAgent({
-          name: request.name,
-          description: request.description,
-          instructions: request.instructions,
-        });
+        await this.createAgent(
+          {
+            name: request.name,
+            description: request.description,
+            instructions: request.instructions,
+          },
+          ownerId,
+        );
         created.push(request.name);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -740,8 +1186,9 @@ export class AgentService {
         const storedRun = database.runs.find((item) => item.id === runId);
         const agent = database.agents.find((item) => item.id === agentId);
         if (!storedRun || !agent) return;
+        const output = this.redactOutput(outcome.result.output, agent.workspacePath);
         storedRun.status = "completed";
-        storedRun.output = outcome.result.output;
+        storedRun.output = output;
         storedRun.usage = outcome.result.usage;
         storedRun.partial = false;
         storedRun.awaitingChildRunId = null;
@@ -751,7 +1198,7 @@ export class AgentService {
           agentId: agent.id,
           runId,
           role: "assistant",
-          content: outcome.result.output,
+          content: output,
           createdAt: completedAt,
         });
         agent.status = "ready";
@@ -763,10 +1210,11 @@ export class AgentService {
     }
 
     const cancelled = outcome.error instanceof RunCancelledError;
-    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+    const rawMessage = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === runId);
       const agent = database.agents.find((item) => item.id === agentId);
+      const message = agent ? this.redactOutput(rawMessage, agent.workspacePath) : rawMessage;
       if (storedRun) {
         storedRun.status = cancelled ? "cancelled" : "failed";
         storedRun.error = message;
@@ -812,7 +1260,10 @@ export class AgentService {
     initialPrompt: string,
     initialThreadId: string | null,
   ): Promise<void> {
-    const workspacePath = this.getAgent(agentId).workspacePath;
+    const agentSnapshot = this.getAgent(agentId);
+    const workspacePath = agentSnapshot.workspacePath;
+    const sandboxMode = agentSnapshot.sandboxMode;
+    const networkAccess = agentSnapshot.networkAccess;
     let prompt = initialPrompt;
     let threadId = initialThreadId;
 
@@ -844,7 +1295,7 @@ export class AgentService {
       let result: RunnerResult;
       try {
         result = await this.runner.run(
-          { agentId, runId, workspacePath, prompt, threadId },
+          { agentId, runId, workspacePath, prompt, threadId, sandboxMode, networkAccess },
           this.progressCallbacks(runId, agentId),
         );
       } catch (error) {
