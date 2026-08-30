@@ -23,6 +23,19 @@ export class JsonStore {
       if (parsed.version !== 1 || !Array.isArray(parsed.agents)) {
         throw new Error("Unsupported database format");
       }
+      parsed.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+      parsed.runs = Array.isArray(parsed.runs) ? parsed.runs : [];
+      for (const run of parsed.runs) {
+        const record = run as unknown as Record<string, unknown>;
+        if (typeof record.retrieval === "undefined") record.retrieval = null;
+        if (typeof record.partial === "undefined") record.partial = false;
+        if (typeof record.runnerHandle === "undefined") record.runnerHandle = null;
+        if (typeof record.parentRunId === "undefined") record.parentRunId = null;
+        if (typeof record.awaitingChildRunId === "undefined") record.awaitingChildRunId = null;
+        if (typeof record.orchestrationIterationCount === "undefined") {
+          record.orchestrationIterationCount = 0;
+        }
+      }
       this.data = parsed;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {

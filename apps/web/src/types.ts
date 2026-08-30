@@ -40,6 +40,13 @@ export interface AgentRun {
   partial?: boolean;
   /** The Run that delegated to this one, if any -- not currently rendered anywhere in the UI. */
   parentRunId?: string | null;
+  retrieval: {
+    status: "no_context" | "weak" | "moderate" | "strong";
+    confidence: number;
+    topScore: number | null;
+    candidateCount: number;
+    matchCount: number;
+  } | null;
 }
 
 export type RunEventType =
@@ -60,6 +67,12 @@ export interface RunEvent {
   occurredAt: string;
   summary: string;
   detail?: Record<string, unknown>;
+}
+
+export interface ResourceSummary {
+  name: string;
+  size: number;
+  updatedAt: string;
 }
 
 export interface SystemInfo {

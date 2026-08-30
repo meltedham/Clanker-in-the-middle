@@ -12,13 +12,18 @@ import {
 } from "./delegation.js";
 import type { AgentCreationRequest } from "./delegation.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import { RagService } from "./rag/rag-service.js";
+import { normalizeUploadContent, type UploadInput } from "./rag/upload-content.js";
 import { JsonStore } from "./store.js";
+import { SharedResourceManager } from "./shared-resource-manager.js";
 import type {
   Agent,
   AgentRun,
   AgentRunner,
   CreateAgentInput,
   Message,
+  RagContext,
+  RagSummary,
   RunnerCallbacks,
   RunnerResult,
   UpdateAgentInput,
@@ -52,13 +57,18 @@ type FinalizeOutcome =
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly ragService: RagService;
+  private readonly sharedResources: SharedResourceManager;
 
   constructor(
     private readonly config: AppConfig,
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
-  ) {}
+  ) {
+    this.ragService = new RagService(config, store);
+    this.sharedResources = new SharedResourceManager(config.sharedResourceRoot);
+  }
 
   /**
    * Boot-time reconciliation. Interrupted Runs fall into two shapes:
@@ -81,6 +91,7 @@ export class AgentService {
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.sharedResources.initialize();
 
     const interrupted = this.store
       .snapshot()
@@ -286,6 +297,40 @@ export class AgentService {
     return { archivedWorkspace };
   }
 
+  async listSharedResources(): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
+    return this.sharedResources.list();
+  }
+
+  async uploadSharedResource(
+    input: UploadInput,
+  ): Promise<{ name: string; size: number; updatedAt: string }> {
+    const content = (await normalizeUploadContent(input)).trim();
+    return this.sharedResources.write(input.name, content);
+  }
+
+  async deleteSharedResource(name: string): Promise<void> {
+    await this.sharedResources.delete(name);
+  }
+
+  async listUploads(agentId: string): Promise<Array<{ name: string; size: number; updatedAt: string }>> {
+    this.getAgent(agentId);
+    return this.workspaces.listUploads(agentId);
+  }
+
+  async uploadAgentResource(
+    agentId: string,
+    input: UploadInput,
+  ): Promise<{ name: string; size: number; updatedAt: string }> {
+    this.getAgent(agentId);
+    const content = (await normalizeUploadContent(input)).trim();
+    return this.workspaces.writeUpload(agentId, input.name, content);
+  }
+
+  async deleteAgentUpload(agentId: string, name: string): Promise<void> {
+    this.getAgent(agentId);
+    await this.workspaces.deleteUpload(agentId, name);
+  }
+
   async startAgent(id: string): Promise<Agent> {
     return this.setStatus(id, "ready");
   }
@@ -323,17 +368,17 @@ export class AgentService {
   async sendMessage(
     agentId: string,
     prompt: string,
-  ): Promise<{ run: AgentRun; message: Message }> {
+  ): Promise<{ run: AgentRun; message: Message; retrieval: RagSummary }> {
     if (!isModelProviderConfigured(this.config)) {
       throw new HttpError(
         503,
         "OpenRouter is not configured. Set OPENROUTER_API_KEY and OPENROUTER_MODEL, then restart.",
       );
     }
-    const { run, message, agentAtStart } = await this.createRunAtomic(agentId, prompt, null);
-    const execution = this.executeRun(agentAtStart, run);
+    const { run, message, agentAtStart, ragContext } = await this.createRunAtomic(agentId, prompt, null);
+    const execution = this.executeRun(agentAtStart, run, ragContext);
     this.trackExecution(agentId, execution);
-    return { run, message };
+    return { run, message, retrieval: ragContext.summary };
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {
@@ -370,7 +415,12 @@ export class AgentService {
     targetAgentId: string,
     prompt: string,
     parentRunId: string | null,
-  ): Promise<{ run: AgentRun; message: Message; agentAtStart: Agent }> {
+  ): Promise<{
+    run: AgentRun;
+    message: Message;
+    agentAtStart: Agent;
+    ragContext: Pick<RagContext, "prompt" | "summary">;
+  }> {
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -389,6 +439,7 @@ export class AgentService {
       parentRunId,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
+      retrieval: null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -421,7 +472,26 @@ export class AgentService {
       }
       return snapshot;
     });
-    return { run, message, agentAtStart };
+
+    let ragContext: RagContext;
+    try {
+      ragContext = await this.ragService.buildContext(agentAtStart, prompt, runId);
+    } catch {
+      ragContext = {
+        prompt,
+        matches: [],
+        summary: emptyRetrievalSummary(),
+      };
+    }
+    run.retrieval = ragContext.summary;
+    await this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === run.id);
+      if (storedRun) {
+        storedRun.retrieval = ragContext.summary;
+      }
+    });
+
+    return { run, message, agentAtStart, ragContext };
   }
 
   private trackExecution(agentId: string, execution: Promise<void>): void {
@@ -449,12 +519,12 @@ export class AgentService {
     targetAgent: Agent,
     task: string,
   ): Promise<AgentRun> {
-    const { run: childRun, agentAtStart } = await this.createRunAtomic(
+    const { run: childRun, agentAtStart, ragContext } = await this.createRunAtomic(
       targetAgent.id,
       task,
       parentRun.id,
     );
-    const execution = this.executeRun(agentAtStart, childRun);
+    const execution = this.executeRun(agentAtStart, childRun, ragContext);
     this.trackExecution(targetAgent.id, execution);
     await execution;
     return this.getRun(childRun.id);
@@ -713,7 +783,11 @@ export class AgentService {
     });
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    ragContext: Pick<RagContext, "prompt" | "summary">,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -721,7 +795,7 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
-    await this.runOrchestrationLoop(run.agentId, run.id, run.prompt, agentAtStart.codexThreadId);
+    await this.runOrchestrationLoop(run.agentId, run.id, ragContext.prompt, agentAtStart.codexThreadId);
   }
 
   /**
@@ -830,4 +904,14 @@ export class AgentService {
       this.cancellationRequests.delete(agentId);
     }
   }
+}
+
+function emptyRetrievalSummary(): RagSummary {
+  return {
+    status: "no_context",
+    confidence: 0,
+    topScore: null,
+    candidateCount: 0,
+    matchCount: 0,
+  };
 }

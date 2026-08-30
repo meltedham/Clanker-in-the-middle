@@ -49,7 +49,10 @@ function delegateBlock(agent: string, task: string): string {
 }
 
 class FakeRunner implements AgentRunner {
+  public readonly prompts: string[] = [];
+
   async run(request: RunnerRequest): Promise<RunnerResult> {
+    this.prompts.push(request.prompt);
     return {
       output: "Completed: " + request.prompt,
       threadId: request.threadId ?? "fake-thread",

@@ -1,3 +1,14 @@
+import type { RagSummary } from "./rag/types.js";
+
+export type {
+  RagStatus,
+  RagSummary,
+  RagSourceType,
+  RagMatch,
+  RagContext,
+  EmbeddingClient,
+} from "./rag/types.js";
+
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
@@ -64,6 +75,8 @@ export interface AgentRun {
    * not per-Run, and survives a restart.
    */
   orchestrationIterationCount: number;
+  /** RAG retrieval summary for this Run's prompt, or null if retrieval wasn't applicable/found nothing. */
+  retrieval: RagSummary | null;
 }
 
 export interface Database {

@@ -25,6 +25,7 @@ services:
       - ./data:/app/data
       - ./workspaces:/app/workspaces
       - ./codex-home:/app/codex-home
+      - ./shared-resources:/app/shared-resources
     init: true
     security_opt:
       - no-new-privileges:true

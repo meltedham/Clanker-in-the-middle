@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import { isRetryableApiError, withRetry } from "./reconnect";
-import type { Agent, AgentRun, Message, RunEvent, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, ResourceSummary, RunEvent, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
   "Inspect this workspace and explain what you would improve first.",
   "Build a responsive single-page todo app with tests.",
 ];
+
+const emptyResourceForm = {
+  name: "",
+  content: "",
+};
 
 const emptyForm = {
   name: "",
@@ -36,6 +41,53 @@ function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
 }
 
+function retrievalLabel(status: NonNullable<AgentRun["retrieval"]>["status"]): string {
+  switch (status) {
+    case "no_context":
+      return "No context";
+    case "weak":
+      return "Weak";
+    case "moderate":
+      return "Moderate";
+    case "strong":
+      return "Strong";
+    default:
+      return status;
+  }
+}
+
+function RetrievalBadge({ retrieval }: { retrieval: NonNullable<AgentRun["retrieval"]> }) {
+  return (
+    <div className={"retrieval-badge retrieval-" + retrieval.status}>
+      <span>Context</span>
+      <strong>{retrievalLabel(retrieval.status)}</strong>
+      <span>{Math.round(retrieval.confidence * 100)}% match</span>
+      <small>
+        {retrieval.matchCount}/{retrieval.candidateCount} chunks
+      </small>
+    </div>
+  );
+}
+
+async function fileToUploadBody(file: File): Promise<{
+  name: string;
+  contentBase64: string;
+  mimeType: string;
+}> {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return {
+    name: file.name,
+    contentBase64: btoa(binary),
+    mimeType: file.type || (file.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : "text/plain"),
+  };
+}
+
 export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -45,6 +97,12 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [prompt, setPrompt] = useState("");
+  const [uploads, setUploads] = useState<ResourceSummary[]>([]);
+  const [sharedResources, setSharedResources] = useState<ResourceSummary[]>([]);
+  const [uploadForm, setUploadForm] = useState(emptyResourceForm);
+  const [sharedForm, setSharedForm] = useState(emptyResourceForm);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [sharedFile, setSharedFile] = useState<File | null>(null);
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
   const [connectionState, setConnectionState] = useState<"connected" | "lost">("connected");
   const [showTrace, setShowTrace] = useState(false);
@@ -84,9 +142,23 @@ export default function App() {
     }
   }, []);
 
+  const refreshUploads = useCallback(async (agentId: string) => {
+    const result = await api.uploads(agentId);
+    if (mountedRef.current && selectedIdRef.current === agentId) {
+      setUploads(result.uploads);
+    }
+  }, []);
+
+  const refreshSharedResources = useCallback(async () => {
+    const result = await api.sharedResources();
+    if (mountedRef.current) {
+      setSharedResources(result.resources);
+    }
+  }, []);
+
   const bootstrap = useCallback(async () => {
-    await Promise.all([refreshAgents(), api.system().then(setSystem)]);
-  }, [refreshAgents]);
+    await Promise.all([refreshAgents(), refreshSharedResources(), api.system().then(setSystem)]);
+  }, [refreshAgents, refreshSharedResources]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -111,10 +183,11 @@ export default function App() {
     setConnectionState("connected");
     if (!selectedId) {
       setMessages([]);
+      setUploads([]);
       return;
     }
-    void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
-      .then(([, result]) => {
+    void Promise.all([refreshMessages(selectedId), refreshUploads(selectedId), api.runs(selectedId)])
+      .then(([, , result]) => {
         if (selectedIdRef.current !== selectedId) return;
         const latest = result.runs[0] ?? null;
         setActiveRun(latest);
@@ -127,7 +200,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, refreshUploads, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -138,6 +211,11 @@ export default function App() {
       });
     }
   }, [selected]);
+
+  useEffect(() => {
+    setUploadFile(null);
+    setUploadForm(emptyResourceForm);
+  }, [selectedId]);
 
   useEffect(() => {
     messageEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -229,6 +307,84 @@ export default function App() {
     try {
       await api.deleteAgent(selected.id);
       await refreshAgents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const publishSharedResource = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = sharedFile
+        ? {
+            ...sharedForm,
+            ...(await fileToUploadBody(sharedFile)),
+            name: sharedForm.name.trim() || sharedFile.name,
+          }
+        : sharedForm;
+      await api.createSharedResource(payload);
+      formElement.reset();
+      setSharedForm(emptyResourceForm);
+      setSharedFile(null);
+      await refreshSharedResources();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadWorkspaceResource = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected) return;
+    const formElement = event.currentTarget;
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = uploadFile
+        ? {
+            ...uploadForm,
+            ...(await fileToUploadBody(uploadFile)),
+            name: uploadForm.name.trim() || uploadFile.name,
+          }
+        : uploadForm;
+      await api.uploadAgentResource(selected.id, payload);
+      formElement.reset();
+      setUploadForm(emptyResourceForm);
+      setUploadFile(null);
+      await refreshUploads(selected.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteShared = async (name: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteSharedResource(name);
+      await refreshSharedResources();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteUpload = async (name: string) => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteAgentUpload(selected.id, name);
+      await refreshUploads(selected.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -557,20 +713,195 @@ export default function App() {
               </form>
             )}
 
+            <section className="resource-grid">
+              <form className="resource-panel" onSubmit={uploadWorkspaceResource}>
+                <div className="resource-panel-heading">
+                  <div>
+                    <span className="eyebrow">Workspace uploads</span>
+                    <h2>Private context</h2>
+                  </div>
+                </div>
+                <label>
+                  File name
+                  <input
+                    value={uploadForm.name}
+                    onChange={(event) => setUploadForm({ ...uploadForm, name: event.target.value })}
+                    placeholder="notes.md"
+                    maxLength={200}
+                  />
+                </label>
+                <label>
+                  File
+                  <input
+                    type="file"
+                    accept=".md,.markdown,.pdf,text/markdown,text/plain,application/pdf"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0] ?? null;
+                      setUploadFile(file);
+                      if (file) {
+                        setUploadForm((current) => ({
+                          ...current,
+                          name: current.name.trim() || file.name,
+                          content: "",
+                        }));
+                      }
+                    }}
+                  />
+                </label>
+                {uploadFile && (
+                  <div className="file-chip">
+                    <strong>{uploadFile.name}</strong>
+                    <span>{uploadFile.type || "file"}</span>
+                  </div>
+                )}
+                <label>
+                  Content {uploadFile ? "(not needed — using the chosen file)" : "(or choose a file above)"}
+                  <textarea
+                    value={uploadForm.content}
+                    onChange={(event) =>
+                      setUploadForm({ ...uploadForm, content: event.target.value })
+                    }
+                    rows={5}
+                    placeholder="Paste a document to add it to this Agent's RAG corpus."
+                    maxLength={1_000_000}
+                    disabled={Boolean(uploadFile)}
+                  />
+                </label>
+                <div className="resource-list">
+                  {uploads.length > 0 ? (
+                    uploads.map((item) => (
+                      <div className="resource-row" key={item.name}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <span>{Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+                        </div>
+                        <button type="button" className="button button-ghost" onClick={() => deleteUpload(item.name)}>
+                          Delete
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="resource-empty">No uploads yet for this Agent.</p>
+                  )}
+                </div>
+                <div className="panel-footer">
+                  <span>Stored inside {selected.name}&apos;s workspace</span>
+                  <button
+                    className="button button-primary"
+                    disabled={
+                      busy ||
+                      !uploadForm.name.trim() ||
+                      (!uploadForm.content.trim() && !uploadFile)
+                    }
+                  >
+                    {busy ? <Spinner /> : "Upload resource"}
+                  </button>
+                </div>
+              </form>
+
+              <form className="resource-panel" onSubmit={publishSharedResource}>
+                <div className="resource-panel-heading">
+                  <div>
+                    <span className="eyebrow">Shared resources</span>
+                    <h2>Reusable context</h2>
+                  </div>
+                </div>
+                <label>
+                  File name
+                  <input
+                    value={sharedForm.name}
+                    onChange={(event) => setSharedForm({ ...sharedForm, name: event.target.value })}
+                    placeholder="shared-notes.md"
+                    maxLength={200}
+                  />
+                </label>
+                <label>
+                  File
+                  <input
+                    type="file"
+                    accept=".md,.markdown,.pdf,text/markdown,text/plain,application/pdf"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0] ?? null;
+                      setSharedFile(file);
+                      if (file) {
+                        setSharedForm((current) => ({
+                          ...current,
+                          name: current.name.trim() || file.name,
+                          content: "",
+                        }));
+                      }
+                    }}
+                  />
+                </label>
+                {sharedFile && (
+                  <div className="file-chip">
+                    <strong>{sharedFile.name}</strong>
+                    <span>{sharedFile.type || "file"}</span>
+                  </div>
+                )}
+                <label>
+                  Content {sharedFile ? "(not needed — using the chosen file)" : "(or choose a file above)"}
+                  <textarea
+                    value={sharedForm.content}
+                    onChange={(event) =>
+                      setSharedForm({ ...sharedForm, content: event.target.value })
+                    }
+                    rows={5}
+                    placeholder="Paste content that all authorized agents can retrieve."
+                    maxLength={1_000_000}
+                    disabled={Boolean(sharedFile)}
+                  />
+                </label>
+                <div className="resource-list">
+                  {sharedResources.length > 0 ? (
+                    sharedResources.map((item) => (
+                      <div className="resource-row" key={item.name}>
+                        <div>
+                          <strong>{item.name}</strong>
+                          <span>{Math.max(1, Math.ceil(item.size / 1024))} KB</span>
+                        </div>
+                        <button type="button" className="button button-ghost" onClick={() => deleteShared(item.name)}>
+                          Delete
+                        </button>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="resource-empty">No shared resources yet.</p>
+                  )}
+                </div>
+                <div className="panel-footer">
+                  <span>Available to all authorized agents via RAG</span>
+                  <button
+                    className="button button-primary"
+                    disabled={
+                      busy ||
+                      !sharedForm.name.trim() ||
+                      (!sharedForm.content.trim() && !sharedFile)
+                    }
+                  >
+                    {busy ? <Spinner /> : "Publish shared resource"}
+                  </button>
+                </div>
+              </form>
+            </section>
+
             <section className="playground">
               <div className="playground-topbar">
                 <div>
                   <span className="eyebrow">Playground</span>
                   <h2>Build something with your Agent</h2>
                 </div>
-                <div className="session-info">
-                  <span className="pulse" />
-                  {selected.codexThreadId ? "Session connected" : "New session"}
-                  {activeRun && (
-                    <button type="button" className="button button-ghost" onClick={toggleTrace}>
-                      {showTrace ? "Hide trace" : "View trace"}
-                    </button>
-                  )}
+                <div className="playground-status">
+                  <div className="session-info">
+                    <span className="pulse" />
+                    {selected.codexThreadId ? "Session connected" : "New session"}
+                    {activeRun && (
+                      <button type="button" className="button button-ghost" onClick={toggleTrace}>
+                        {showTrace ? "Hide trace" : "View trace"}
+                      </button>
+                    )}
+                  </div>
+                  {activeRun?.retrieval && <RetrievalBadge retrieval={activeRun.retrieval} />}
                 </div>
               </div>
 

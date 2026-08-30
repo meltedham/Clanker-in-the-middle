@@ -1,4 +1,4 @@
-import type { Agent, AgentRun, Message, RunEvent, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, ResourceSummary, RunEvent, SystemInfo } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -69,8 +69,45 @@ export const api = {
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
+  uploads: (id: string) =>
+    request<{ uploads: ResourceSummary[] }>("/api/agents/" + id + "/uploads"),
+  uploadAgentResource: (
+    id: string,
+    body: {
+      name: string;
+      content?: string;
+      contentBase64?: string;
+      mimeType?: string;
+    },
+  ) =>
+    request<{ upload: ResourceSummary }>("/api/agents/" + id + "/uploads", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteAgentUpload: (id: string, name: string) =>
+    request<{ ok: boolean }>("/api/agents/" + id + "/uploads/" + encodeURIComponent(name), {
+      method: "DELETE",
+    }),
+  sharedResources: () =>
+    request<{ resources: ResourceSummary[] }>("/api/shared-resources"),
+  createSharedResource: (
+    body: {
+      name: string;
+      content?: string;
+      contentBase64?: string;
+      mimeType?: string;
+    },
+  ) =>
+    request<{ resource: ResourceSummary }>("/api/shared-resources", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteSharedResource: (name: string) =>
+    request<{ ok: boolean }>("/api/shared-resources/" + encodeURIComponent(name), {
+      method: "DELETE",
+    }),
   sendMessage: (id: string, content: string) =>
-    request<{ run: AgentRun; message: Message }>(
+    request<{ run: AgentRun; message: Message; retrieval: AgentRun["retrieval"] }>(
       "/api/agents/" + id + "/messages",
       {
         method: "POST",
