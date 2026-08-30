@@ -267,6 +267,58 @@ describe("Agent lifecycle", () => {
     await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
   });
 
+  it("runs two different Agents concurrently -- the second's runner call is never blocked behind the first's", async () => {
+    let resolveA!: (result: RunnerResult) => void;
+    let resolveB!: (result: RunnerResult) => void;
+    const pendingA = new Promise<RunnerResult>((resolve) => {
+      resolveA = resolve;
+    });
+    const pendingB = new Promise<RunnerResult>((resolve) => {
+      resolveB = resolve;
+    });
+    let agentAId = "";
+    let calledA = false;
+    let calledB = false;
+    const runner: AgentRunner = {
+      run: (request) => {
+        if (request.agentId === agentAId) {
+          calledA = true;
+          return pendingA;
+        }
+        calledB = true;
+        return pendingB;
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async () => ({ stillRunning: false, reason: "not reachable in this fake" }),
+    };
+    const service = await makeService(runner);
+    const agentA = await service.createAgent({ name: "Alpha" });
+    const agentB = await service.createAgent({ name: "Beta" });
+    agentAId = agentA.id;
+
+    const [sendA, sendB] = await Promise.all([
+      service.sendMessage(agentA.id, "work A"),
+      service.sendMessage(agentB.id, "work B"),
+    ]);
+
+    // Both runner calls must actually be in flight at once -- if execution
+    // were secretly serialized across Agents (e.g. a global lock instead
+    // of the per-Agent one this design uses), calledB would still be
+    // false here since Agent A's own pending promise hasn't resolved yet.
+    await expect.poll(() => calledA && calledB).toBe(true);
+    expect(service.getAgent(agentA.id).status).toBe("busy");
+    expect(service.getAgent(agentB.id).status).toBe("busy");
+
+    resolveA({ output: "done A", threadId: "tA", usage: null });
+    resolveB({ output: "done B", threadId: "tB", usage: null });
+
+    await expect.poll(() => service.getRun(sendA.run.id).status).toBe("completed");
+    await expect.poll(() => service.getRun(sendB.run.id).status).toBe("completed");
+    expect(service.getRun(sendA.run.id).output).toBe("done A");
+    expect(service.getRun(sendB.run.id).output).toBe("done B");
+  });
+
   it("does not let start reset a busy Agent, and replies gracefully instead of double-running a second message", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {

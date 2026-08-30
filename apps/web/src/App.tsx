@@ -164,6 +164,7 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [whoami, setWhoami] = useState<AuthUser | null>(null);
   const [showShare, setShowShare] = useState(false);
+  const [showResources, setShowResources] = useState(false);
   const [grants, setGrants] = useState<Grant[]>([]);
   const [users, setUsers] = useState<Array<{ id: string; name: string }>>([]);
   const [shareUserId, setShareUserId] = useState("");
@@ -337,6 +338,7 @@ export default function App() {
     setActiveRun(null);
     setShowSettings(false);
     setShowShare(false);
+    setShowResources(false);
     setShowTrace(false);
     setTraceEvents(null);
     setConnectionState("connected");
@@ -521,6 +523,7 @@ export default function App() {
     if (!selected) return;
     setShowShare(true);
     setShowSettings(false);
+    setShowResources(false);
     setError(null);
     try {
       const [grantsResult, usersResult] = await Promise.all([
@@ -1197,8 +1200,20 @@ export default function App() {
                 <button
                   className="button button-ghost"
                   onClick={() => {
+                    setShowResources((value) => !value);
+                    setShowSettings(false);
+                    setShowShare(false);
+                  }}
+                  disabled={busy}
+                >
+                  Resources
+                </button>
+                <button
+                  className="button button-ghost"
+                  onClick={() => {
                     setShowSettings((value) => !value);
                     setShowShare(false);
+                    setShowResources(false);
                   }}
                   disabled={busy || selected.status === "busy"}
                 >
@@ -1232,7 +1247,12 @@ export default function App() {
             </header>
 
             {showSettings && (
-              <form className="settings-panel" onSubmit={saveAgent}>
+              <div className="modal-backdrop" onMouseDown={() => setShowSettings(false)}>
+              <form
+                className="modal settings-panel"
+                onSubmit={saveAgent}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
                 <div className="settings-title">
                   <div>
                     <span className="eyebrow">Agent configuration</span>
@@ -1373,10 +1393,16 @@ export default function App() {
                   )}
                 </div>
               </form>
+              </div>
             )}
 
             {showShare && (
-              <form className="settings-panel" onSubmit={submitShare}>
+              <div className="modal-backdrop" onMouseDown={() => setShowShare(false)}>
+              <form
+                className="modal settings-panel"
+                onSubmit={submitShare}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
                 <div className="settings-title">
                   <div>
                     <span className="eyebrow">Access control</span>
@@ -1450,9 +1476,20 @@ export default function App() {
                   </button>
                 </div>
               </form>
+              </div>
             )}
 
-            <section className="resource-grid">
+            {showResources && (
+              <div className="modal-backdrop" onMouseDown={() => setShowResources(false)}>
+              <div className="modal modal-wide" onMouseDown={(event) => event.stopPropagation()}>
+                <div className="settings-title">
+                  <div>
+                    <span className="eyebrow">Context</span>
+                    <h2>Workspace &amp; shared resources</h2>
+                  </div>
+                  <button type="button" onClick={() => setShowResources(false)}>×</button>
+                </div>
+                <section className="resource-grid">
               <form className="resource-panel" onSubmit={uploadWorkspaceResource}>
                 <div className="resource-panel-heading">
                   <div>
@@ -1622,7 +1659,10 @@ export default function App() {
                   </button>
                 </div>
               </form>
-            </section>
+                </section>
+              </div>
+              </div>
+            )}
 
             <section className="playground">
               <div className="playground-topbar">
