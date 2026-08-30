@@ -10,6 +10,7 @@ export type {
 } from "./rag/types.js";
 
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
+export type AgentStopReason = "budget_exhausted" | "manual" | "kill_switch";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
 
@@ -97,6 +98,7 @@ export interface Agent {
   instructions: string;
   tokenBudget: number | null;
   status: AgentStatus;
+  stopReason: AgentStopReason | null;
   ownerId: string;
   sandboxMode: SandboxMode;
   networkAccess: boolean;

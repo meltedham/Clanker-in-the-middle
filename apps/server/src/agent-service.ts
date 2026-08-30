@@ -12,7 +12,7 @@ import {
   parseDelegation,
 } from "./delegation.js";
 import type { AgentCreationRequest } from "./delegation.js";
-import { AgentBusyError, HttpError, RunCancelledError, TokenBudgetExceededError } from "./errors.js";
+import { HttpError, RunCancelledError } from "./errors.js";
 import { RagService } from "./rag/rag-service.js";
 import { normalizeUploadContent, type UploadInput } from "./rag/upload-content.js";
 import { JsonStore } from "./store.js";
@@ -43,7 +43,7 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 const countUsageTokens = (usage: RunUsage | null): number =>
-  (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0) + (usage?.outputTokens ?? 0);
+  (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
 
 const totalAgentTokens = (database: Database, agentId: string): number =>
   database.runs
@@ -264,8 +264,16 @@ export class AgentService {
         if (agent.tokenBudget === undefined) {
           agent.tokenBudget = null;
         }
+        if (agent.stopReason === undefined) {
+          const budgetExceeded =
+            agent.status === "stopped" &&
+            agent.tokenBudget !== null &&
+            totalAgentTokens(database, agent.id) >= agent.tokenBudget;
+          agent.stopReason = budgetExceeded ? "budget_exhausted" : null;
+        }
         if (agent.status === "busy") {
           agent.status = "ready";
+          agent.stopReason = null;
           agent.updatedAt = now();
         }
         // Back-compat: Agents created before per-Agent runtime policy
@@ -650,6 +658,7 @@ export class AgentService {
       instructions: input.instructions?.trim() ?? "",
       tokenBudget: input.tokenBudget ?? null,
       status: "ready",
+      stopReason: null,
       ownerId,
       sandboxMode: input.sandboxMode ?? this.config.codexSandboxMode,
       networkAccess: input.networkAccess ?? true,
@@ -699,8 +708,20 @@ export class AgentService {
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
       if (input.sandboxMode !== undefined) agent.sandboxMode = input.sandboxMode;
       if (input.networkAccess !== undefined) agent.networkAccess = input.networkAccess;
-      if (input.tokenBudget !== undefined) agent.tokenBudget = input.tokenBudget;
-      agent.lastError = null;
+      if (input.tokenBudget !== undefined) {
+        agent.tokenBudget = input.tokenBudget;
+        // Raising (or lifting) the budget past what's already been spent
+        // resumes an Agent that was auto-paused for running out -- but
+        // never a manual Stop or the kill switch, which stay stopped until
+        // someone explicitly starts the Agent again.
+        const budgetAllowsRuns =
+          input.tokenBudget === null || totalAgentTokens(database, id) < input.tokenBudget;
+        if (agent.stopReason === "budget_exhausted" && budgetAllowsRuns) {
+          agent.status = "ready";
+          agent.stopReason = null;
+        }
+      }
+      agent.lastError = agent.stopReason === "budget_exhausted" ? tokenBudgetExceededMessage : null;
       agent.updatedAt = now();
       return structuredClone(agent);
     });
@@ -785,7 +806,7 @@ export class AgentService {
       throw new HttpError(403, "Only the Agent's owner or an admin can stop it");
     }
     await this.cancelExecution(id);
-    return this.setStatus(id, "stopped");
+    return this.setStatus(id, "stopped", "manual");
   }
 
   /**
@@ -810,6 +831,7 @@ export class AgentService {
         throw new HttpError(404, "Agent not found");
       }
       storedAgent.status = "stopped";
+      storedAgent.stopReason = "kill_switch";
       storedAgent.lastError = null;
       storedAgent.updatedAt = killedAt;
       return structuredClone(storedAgent);
@@ -1016,6 +1038,7 @@ export class AgentService {
         database.runs.push(completedRun);
         database.messages.push(message, assistantMessage);
         storedAgent.status = "stopped";
+        storedAgent.stopReason = "budget_exhausted";
         storedAgent.lastError = tokenBudgetExceededMessage;
         storedAgent.updatedAt = timestamp;
         return { kind: "short-circuited", run: completedRun, assistantMessage };
@@ -1388,6 +1411,7 @@ export class AgentService {
           createdAt: completedAt,
         });
         agent.status = budgetExceeded ? "stopped" : "ready";
+        agent.stopReason = budgetExceeded ? "budget_exhausted" : null;
         agent.codexThreadId = outcome.result.threadId;
         agent.lastError = budgetExceeded ? tokenBudgetExceededMessage : null;
         agent.updatedAt = completedAt;
@@ -1410,6 +1434,7 @@ export class AgentService {
       if (agent) {
         if (agent.status !== "stopped") {
           agent.status = cancelled ? "ready" : "error";
+          agent.stopReason = null;
         }
         agent.lastError = cancelled ? null : message;
         agent.updatedAt = completedAt;
@@ -1532,7 +1557,11 @@ export class AgentService {
     }
   }
 
-  private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
+  private async setStatus(
+    id: string,
+    status: Agent["status"],
+    stopReason: Agent["stopReason"] = null,
+  ): Promise<Agent> {
     return this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === id);
       if (!agent) {
@@ -1542,6 +1571,7 @@ export class AgentService {
         throw new HttpError(409, "Stop the active run before starting this Agent");
       }
       agent.status = status;
+      agent.stopReason = status === "stopped" ? stopReason : null;
       if (status === "ready") agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);

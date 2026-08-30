@@ -152,6 +152,51 @@ describe("Agent lifecycle", () => {
     expect((await service.updateAgent(agent.id, { tokenBudget: null })).tokenBudget).toBeNull();
   });
 
+  it("resumes only budget-paused Agents when the new budget allows another run", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Budget resume", tokenBudget: 10 });
+
+    await service.sendMessage(agent.id, "first run");
+    await expect.poll(() => service.getAgent(agent.id).status).toBe("stopped");
+    expect(service.getAgent(agent.id).stopReason).toBe("budget_exhausted");
+
+    expect((await service.updateAgent(agent.id, { tokenBudget: 15 })).status).toBe("stopped");
+    const resumed = await service.updateAgent(agent.id, { tokenBudget: 100 });
+    expect(resumed.status).toBe("ready");
+    expect(resumed.stopReason).toBeNull();
+  });
+
+  it("does not undo manual or kill-switch stops when the budget changes", async () => {
+    const service = await makeService();
+    const manual = await service.createAgent({ name: "Manual", tokenBudget: 10 });
+    const killed = await service.createAgent({ name: "Killed", tokenBudget: 10 });
+
+    await service.stopAgent(manual.id);
+    await service.killAgent(killed.id);
+
+    expect((await service.updateAgent(manual.id, { tokenBudget: null })).status).toBe("stopped");
+    expect(service.getAgent(manual.id).stopReason).toBe("manual");
+    expect((await service.updateAgent(killed.id, { tokenBudget: null })).status).toBe("stopped");
+    expect(service.getAgent(killed.id).stopReason).toBe("kill_switch");
+  });
+
+  it("does not count cached input tokens twice", async () => {
+    const service = await makeService({
+      run: async () => ({
+        output: "done",
+        threadId: "thread",
+        usage: { inputTokens: 12, cachedInputTokens: 10, outputTokens: 5 },
+      }),
+      cancel: async () => false,
+      isAvailable: async () => true,
+    });
+    const agent = await service.createAgent({ name: "Cached", tokenBudget: 20 });
+
+    const { run } = await service.sendMessage(agent.id, "first");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getAgent(agent.id).status).toBe("ready");
+  });
+
   it("persists a playground conversation", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Coder" });
