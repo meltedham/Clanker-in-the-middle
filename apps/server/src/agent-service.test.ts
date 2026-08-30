@@ -471,6 +471,36 @@ describe("Multi-agent delegation", () => {
     expect(researcherMessages[0]?.content).toBe("find X");
   });
 
+  it("reminds a resumed thread of the current roster, since Codex does not reliably re-read AGENTS.md on resume", async () => {
+    // Live-observed bug: a Codex thread resumed via `codex exec resume`
+    // can keep answering from whatever roster it saw on its first turn,
+    // even though AGENTS.md on disk is already current -- a freshly
+    // created Agent was invisible to an in-flight thread. Only the
+    // conversation itself is reliably fresh, so the reminder must be in
+    // the prompt text, not just the file.
+    const seenPrompts: string[] = [];
+    const runner = new ScriptedRunner((request, callNumber) => {
+      seenPrompts.push(request.prompt);
+      return { output: "turn " + callNumber, threadId: "steady-thread", usage: null };
+    });
+    const service = await makeService(runner);
+    const solo = await service.createAgent({ name: "Solo" });
+
+    const first = await service.sendMessage(solo.id, "first message, brand-new thread");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    // No other Agent exists yet, and codexThreadId was null going in --
+    // neither condition for the reminder is met.
+    expect(seenPrompts[0]).toBe("first message, brand-new thread");
+
+    await service.createAgent({ name: "Helper" });
+    const second = await service.sendMessage(solo.id, "second message, resumed thread");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+    const secondPrompt = seenPrompts[1] ?? "";
+    expect(secondPrompt).toContain("Current Agent roster");
+    expect(secondPrompt).toContain("Helper");
+    expect(secondPrompt).toContain("second message, resumed thread");
+  });
+
   it("rejects self-delegation and lets the orchestrator recover on the same thread", async () => {
     const runner = new ScriptedRunner((_request, callNumber) => {
       if (callNumber === 1) {
@@ -484,6 +514,27 @@ describe("Multi-agent delegation", () => {
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
     expect(service.getRun(run.id).output).toBe("Fine, I'll do it myself.");
     expect(service.getRuns(agent.id)).toHaveLength(1); // no child run created
+  });
+
+  it("feeds the live roster back into the retry prompt when the named target doesn't exist -- not reliant on the model re-reading AGENTS.md", async () => {
+    // A resumed Codex thread can keep answering from whatever roster it saw
+    // on its first turn, even once AGENTS.md on disk is already current
+    // (observed live: a freshly created Agent was invisible to an
+    // in-flight thread). The retry prompt itself must carry the real
+    // roster, since a file the model may not revisit isn't enough.
+    const runner = new ScriptedRunner((_request, callNumber) => {
+      if (callNumber === 1) {
+        return { output: delegateBlock("Ghost", "help me"), threadId: "t1", usage: null };
+      }
+      expect(_request.prompt).toContain("Sidekick: a real helper");
+      return { output: "Found it, delegating for real now.", threadId: "t1", usage: null };
+    });
+    const service = await makeService(runner);
+    const agent = await service.createAgent({ name: "Orchestrator" });
+    await service.createAgent({ name: "Sidekick", description: "a real helper" });
+    const { run } = await service.sendMessage(agent.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("Found it, delegating for real now.");
   });
 
   it("rejects delegating to a busy Agent without hard-failing the orchestration", async () => {

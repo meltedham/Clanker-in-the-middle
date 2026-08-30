@@ -7,6 +7,7 @@ import {
   MAX_ORCHESTRATION_ITERATIONS,
   collectAncestorAgentIds,
   findRootRun,
+  formatRoster,
   parseAgentCreation,
   parseDelegation,
 } from "./delegation.js";
@@ -252,6 +253,16 @@ export class AgentService {
         }
         if (typeof agent.networkAccess !== "boolean") {
           agent.networkAccess = true;
+        }
+        // Back-compat: Agents created before ownership existed have no
+        // `ownerId` in their stored JSON. Without this, `undefined` would
+        // never match a real user's id in assertAccess -- the moment
+        // identity activates, these Agents would become permanently
+        // inaccessible to everyone but an admin. Falling back to the same
+        // "unclaimed" sentinel a fresh Agent gets when created without an
+        // owner keeps them visible platform-wide until someone claims them.
+        if (typeof agent.ownerId !== "string" || agent.ownerId.length === 0) {
+          agent.ownerId = UNCLAIMED_OWNER_ID;
         }
       }
       for (const seed of this.config.users) {
@@ -978,7 +989,22 @@ export class AgentService {
       (agent) => agent.name.trim().toLowerCase() === targetName.trim().toLowerCase(),
     );
     if (!target) {
-      return { ok: false, reason: 'No Agent named "' + targetName + '" exists in this workspace.' };
+      // A resumed Codex thread does not reliably re-read AGENTS.md on every
+      // turn -- it can keep answering from whatever roster was loaded on
+      // the thread's first turn, even though the file on disk is already
+      // current (confirmed live: a freshly created Agent was invisible to
+      // an in-progress thread despite AGENTS.md already listing it). Embed
+      // the real, current roster directly in the rejection itself so the
+      // model recovers from live conversation state, not a file it may not
+      // revisit.
+      return {
+        ok: false,
+        reason:
+          'No Agent named "' +
+          targetName +
+          '" exists. The current roster is:\n' +
+          formatRoster(parentRun.agentId, roster),
+      };
     }
     if (target.id === parentRun.agentId) {
       return { ok: false, reason: "You cannot delegate to yourself." };
@@ -1243,7 +1269,30 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
-    await this.runOrchestrationLoop(run.agentId, run.id, ragContext.prompt, agentAtStart.codexThreadId);
+    const initialPrompt = this.withFreshRosterReminder(agentAtStart, ragContext.prompt);
+    await this.runOrchestrationLoop(run.agentId, run.id, initialPrompt, agentAtStart.codexThreadId);
+  }
+
+  /**
+   * A resumed Codex thread does not reliably re-read AGENTS.md on every
+   * turn -- confirmed live, it can keep answering delegation questions from
+   * whatever roster it saw on the thread's very first turn, even once the
+   * file on disk is already current (e.g. a freshly created Agent was
+   * invisible to an in-flight thread despite AGENTS.md already listing
+   * it). Only matters for a RESUMED thread -- a brand-new one reads
+   * AGENTS.md fresh as part of starting up -- and only when there's
+   * actually another Agent to delegate to.
+   */
+  private withFreshRosterReminder(agentAtStart: Agent, prompt: string): string {
+    if (!agentAtStart.codexThreadId) return prompt;
+    const roster = this.listAgents();
+    if (roster.length <= 1) return prompt;
+    return (
+      "[Current Agent roster -- this may have changed since your last turn]\n" +
+      formatRoster(agentAtStart.id, roster) +
+      "\n\n" +
+      prompt
+    );
   }
 
   /**

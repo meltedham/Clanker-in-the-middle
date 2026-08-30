@@ -28,7 +28,13 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    temporaryDirectories.splice(0).map((directory) =>
+      // maxRetries/retryDelay absorb the occasional Windows ENOTEMPTY/EBUSY
+      // that happens when a Run's fire-and-forget background execution
+      // (sendMessage returns before executeRun finishes) is still writing
+      // AGENTS.md/store checkpoints right as the directory is removed.
+      rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+    ),
   );
 });
 
