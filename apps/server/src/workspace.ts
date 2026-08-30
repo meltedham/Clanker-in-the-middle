@@ -1,6 +1,6 @@
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { DELEGATE_BLOCK_INSTRUCTIONS, formatRoster } from "./delegation.js";
+import { CREATE_AGENTS_BLOCK_INSTRUCTIONS, DELEGATE_BLOCK_INSTRUCTIONS, formatRoster } from "./delegation.js";
 import type { Agent } from "./types.js";
 
 export class WorkspaceManager {
@@ -54,6 +54,8 @@ export class WorkspaceManager {
       "- Preserve existing user files and avoid destructive operations.",
       "- Build and test changes when practical.",
       "- Never print environment variables or credentials.",
+      "",
+      CREATE_AGENTS_BLOCK_INSTRUCTIONS,
       "",
       DELEGATE_BLOCK_INSTRUCTIONS,
       "",

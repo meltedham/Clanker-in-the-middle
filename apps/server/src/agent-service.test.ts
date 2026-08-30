@@ -598,6 +598,85 @@ describe("Multi-agent delegation", () => {
   });
 });
 
+describe("Orchestrator-driven Agent creation", () => {
+  it("creates the requested Agents, makes them delegatable next turn, and reports the result back", async () => {
+    let orchestratorId = "";
+    // The Researcher agent doesn't exist (has no id) until mid-run, so the
+    // script distinguishes its calls by "not the orchestrator" rather than
+    // a not-yet-known id.
+    const runner = new ScriptedRunner((request, callNumber) => {
+      if (request.agentId === orchestratorId) {
+        if (callNumber === 1) {
+          return {
+            output:
+              '```create-agents\n[{"name": "Researcher", "description": "Finds things"}]\n```',
+            threadId: "t1",
+            usage: null,
+          };
+        }
+        if (callNumber === 2) {
+          // Roster must already include the newly created Agent on the
+          // very next turn, and the creation summary is fed back as the prompt.
+          expect(request.prompt).toMatch(/Created: Researcher/);
+          return { output: delegateBlock("Researcher", "find X"), threadId: "t1", usage: null };
+        }
+        expect(request.prompt).toContain("X is 42.");
+        return { output: "The answer is 42.", threadId: "t1", usage: null };
+      }
+      return { output: "X is 42.", threadId: "r1", usage: null };
+    });
+
+    const service = await makeService(runner);
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+    orchestratorId = orchestrator.id;
+
+    const { run } = await service.sendMessage(orchestrator.id, "spin up a researcher and use it");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("The answer is 42.");
+
+    const researcher = service.listAgents().find((agent) => agent.name === "Researcher");
+    expect(researcher).toBeDefined();
+    expect(service.getRuns(researcher!.id)).toHaveLength(1);
+  });
+
+  it("skips a name that already exists instead of creating a confusing duplicate", async () => {
+    const runner = new ScriptedRunner((_request, callNumber) => {
+      if (callNumber === 1) {
+        return {
+          output: '```create-agents\n[{"name": "Existing"}]\n```',
+          threadId: "t",
+          usage: null,
+        };
+      }
+      expect(_request.prompt).toMatch(/Skipped: Existing \(already exists\)/);
+      return { output: "ok, using the existing one", threadId: "t", usage: null };
+    });
+    const service = await makeService(runner);
+    await service.createAgent({ name: "Existing" });
+    const orchestrator = await service.createAgent({ name: "Orchestrator" });
+
+    const { run } = await service.sendMessage(orchestrator.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toBe("ok, using the existing one");
+    // Still only one Agent named "Existing" -- no duplicate created.
+    expect(service.listAgents().filter((agent) => agent.name === "Existing")).toHaveLength(1);
+  });
+
+  it("never crashes on a malformed create-agents block -- falls through to a normal final answer check", async () => {
+    const service = await makeService(
+      new ScriptedRunner(() => ({
+        output: "```create-agents\nnot valid json\n```",
+        threadId: "t",
+        usage: null,
+      })),
+    );
+    const agent = await service.createAgent({ name: "Solo" });
+    const { run } = await service.sendMessage(agent.id, "start");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).output).toContain("```create-agents");
+  });
+});
+
 describe("Multi-agent delegation and reconciliation across a restart", () => {
   it("re-parses a reattached container's recovered output for a delegate block instead of leaking it to the user", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));

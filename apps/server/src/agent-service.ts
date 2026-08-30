@@ -2,12 +2,15 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isModelProviderConfigured } from "./config.js";
 import {
+  MAX_AGENTS_PER_CREATE_BLOCK,
   MAX_DELEGATION_DEPTH,
   MAX_ORCHESTRATION_ITERATIONS,
   collectAncestorAgentIds,
   findRootRun,
+  parseAgentCreation,
   parseDelegation,
 } from "./delegation.js";
+import type { AgentCreationRequest } from "./delegation.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import { JsonStore } from "./store.js";
 import type {
@@ -553,16 +556,23 @@ export class AgentService {
   /**
    * Given a RunnerResult that just came back -- either from a live
    * `runner.run()` call in the loop below, or recovered via `reconcile()`'s
-   * reattachment -- decides whether it's the orchestrator's final answer or
-   * another delegation round. Shared by both paths so a reattached
-   * process's recovered output is never blindly presented to the user
-   * without checking for a trailing delegate block first.
+   * reattachment -- decides whether it's the orchestrator's final answer,
+   * an agent-creation request, or another delegation round. Shared by both
+   * paths so a reattached process's recovered output is never blindly
+   * presented to the user without checking for a trailing directive block
+   * first.
    */
   private async resolveIteration(
     runId: string,
     agentId: string,
     result: RunnerResult,
   ): Promise<IterationOutcome> {
+    const creationRequests = parseAgentCreation(result.output);
+    if (creationRequests) {
+      const summary = await this.handleAgentCreation(creationRequests);
+      return { kind: "continue", nextPrompt: summary };
+    }
+
     const delegation = parseDelegation(result.output);
     if (!delegation) {
       await this.finalizeRun(runId, agentId, { kind: "success", result });
@@ -593,6 +603,57 @@ export class AgentService {
     } finally {
       await this.clearAwaitingChild(runId);
     }
+  }
+
+  /**
+   * Actually creates the requested Agents (reusing the ordinary
+   * `createAgent` path, so each gets a real workspace/AGENTS.md exactly
+   * like one created through the UI), skipping any name that already
+   * exists in the roster (case-insensitive) rather than creating a
+   * confusing duplicate an exact-name `` ```delegate `` lookup couldn't
+   * disambiguate. Returns a summary to feed back as the orchestrator's
+   * next prompt; never throws -- a per-item failure is reported in the
+   * summary instead of aborting the whole batch.
+   */
+  private async handleAgentCreation(requests: AgentCreationRequest[]): Promise<string> {
+    const capped = requests.slice(0, MAX_AGENTS_PER_CREATE_BLOCK);
+    const overflow = requests.length - capped.length;
+    const created: string[] = [];
+    const skipped: string[] = [];
+
+    for (const request of capped) {
+      const existing = this.listAgents().find(
+        (agent) => agent.name.trim().toLowerCase() === request.name.trim().toLowerCase(),
+      );
+      if (existing) {
+        skipped.push(request.name + " (already exists)");
+        continue;
+      }
+      try {
+        await this.createAgent({
+          name: request.name,
+          description: request.description,
+          instructions: request.instructions,
+        });
+        created.push(request.name);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        skipped.push(request.name + " (failed: " + message + ")");
+      }
+    }
+
+    const lines = ["[Agent creation result]"];
+    if (created.length > 0) lines.push("Created: " + created.join(", "));
+    if (skipped.length > 0) lines.push("Skipped: " + skipped.join(", "));
+    if (overflow > 0) {
+      lines.push(
+        overflow + " additional Agent(s) were not created (limit is " + MAX_AGENTS_PER_CREATE_BLOCK + " per request).",
+      );
+    }
+    lines.push(
+      "Continue the task -- you can now delegate to any newly created Agent with a ```delegate block.",
+    );
+    return lines.join("\n");
   }
 
   private async clearAwaitingChild(runId: string): Promise<void> {

@@ -261,8 +261,12 @@ export default function App() {
         }
         if (mountedRef.current) setConnectionState("connected");
         if (selectedIdRef.current === agentId) setActiveRun(result.run);
+        // Orchestration Runs stay "running" across every delegation/creation
+        // round, so refresh the sidebar on every tick -- otherwise newly
+        // created sub-agents stay invisible until the whole chain finishes.
+        if (mountedRef.current) void refreshAgents();
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await refreshMessages(agentId);
           return;
         }
       }
