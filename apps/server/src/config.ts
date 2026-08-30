@@ -61,6 +61,10 @@ const envSchema = z.object({
   // legacy shared APP_AUTH_TOKEN) unchanged.
   APP_USERS: z.string().trim().optional(),
   MAX_PROMPT_CHARS: z.coerce.number().int().min(1_000).default(20_000),
+  // Applied only to POST /api/login (per source IP) -- a password-auth
+  // endpoint with no other guard against credential-stuffing/brute-force.
+  LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+  LOGIN_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   OPENROUTER_BASE_URL: z
     .string()
     .url()
@@ -149,6 +153,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     sharedResourceRoot: path.resolve(env.SHARED_RESOURCE_ROOT),
     users,
     maxPromptChars: env.MAX_PROMPT_CHARS,
+    loginRateLimitMax: env.LOGIN_RATE_LIMIT_MAX,
+    loginRateLimitWindowMs: env.LOGIN_RATE_LIMIT_WINDOW_MS,
     nodeEnv: env.NODE_ENV,
     ragTopK: 8,
     ragChunkSize: 1_200,

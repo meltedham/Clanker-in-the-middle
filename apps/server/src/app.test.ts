@@ -186,6 +186,54 @@ describe("HTTP boundary", () => {
     await app.close();
   });
 
+  it("rejects path-traversal and reserved resource names", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), service, emptyTrace);
+
+    const traversal = await app.inject({
+      method: "POST",
+      url: "/api/shared-resources",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ name: "..", content: "escape" }),
+    });
+    expect(traversal.statusCode).toBe(400);
+
+    const currentDir = await app.inject({
+      method: "POST",
+      url: "/api/shared-resources",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ name: ".", content: "escape" }),
+    });
+    expect(currentDir.statusCode).toBe(400);
+
+    const reservedDevice = await app.inject({
+      method: "POST",
+      url: "/api/agents/123e4567-e89b-12d3-a456-426614174000/uploads",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ name: "NUL.txt", content: "device collision" }),
+    });
+    expect(reservedDevice.statusCode).toBe(400);
+
+    const trailingDot = await app.inject({
+      method: "DELETE",
+      url: "/api/shared-resources/" + encodeURIComponent("notes.md."),
+    });
+    expect(trailingDot.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it("rejects message content containing a NUL byte", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), service, emptyTrace);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agents/123e4567-e89b-12d3-a456-426614174000/messages",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ content: "hello" + String.fromCharCode(0) + "world" }),
+    });
+    expect(response.statusCode).toBe(400);
+    await app.close();
+  });
+
   it("returns retrieval summary with message sends", async () => {
     const app = await createApp(loadConfig({ NODE_ENV: "test" }), service, emptyTrace);
     const response = await app.inject({

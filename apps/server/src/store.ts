@@ -37,6 +37,12 @@ export class JsonStore {
         if (typeof record.orchestrationIterationCount === "undefined") {
           record.orchestrationIterationCount = 0;
         }
+        // Back-compat: Runs persisted before delegation-target visibility
+        // was scoped to the triggering actor have no `actorId` at all.
+        // Treating that the same as an explicit null falls back to the
+        // pre-existing (unfiltered) roster for a Run already in flight when
+        // this shipped -- it only affects Runs created after this point.
+        if (typeof record.actorId === "undefined") record.actorId = null;
       }
       // Back-compat: databases written before user identity existed have no
       // `users` array yet.
