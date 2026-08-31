@@ -1,6 +1,7 @@
 import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { CREATE_AGENTS_BLOCK_INSTRUCTIONS, DELEGATE_BLOCK_INSTRUCTIONS, formatRoster } from "./delegation.js";
+import { resolveWithinRoot } from "./safe-path.js";
 import type { Agent } from "./types.js";
 
 export interface WorkspaceFileSummary {
@@ -102,13 +103,13 @@ export class WorkspaceManager {
   async writeUpload(agentId: string, name: string, content: string): Promise<WorkspaceFileSummary> {
     const uploadRoot = this.uploadsPath(agentId);
     await mkdir(uploadRoot, { recursive: true });
-    const uploadPath = path.join(uploadRoot, name);
+    const uploadPath = resolveWithinRoot(uploadRoot, name);
     await writeFile(uploadPath, content, "utf8");
     return this.describeFile(uploadPath, name);
   }
 
   async deleteUpload(agentId: string, name: string): Promise<void> {
-    await rm(path.join(this.uploadsPath(agentId), name), { force: true });
+    await rm(resolveWithinRoot(this.uploadsPath(agentId), name), { force: true });
   }
 
   private async listFiles(directory: string): Promise<WorkspaceFileSummary[]> {

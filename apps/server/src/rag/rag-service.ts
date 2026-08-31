@@ -13,6 +13,17 @@ interface ChunkCandidate {
   content: string;
 }
 
+interface EligibleFile {
+  path: string;
+  mtimeMs: number;
+}
+
+// Unbounded growth guard for chunkEmbeddingCache -- once it crosses this
+// many entries, the oldest half (Map preserves insertion order) is evicted
+// rather than letting a long-running server accumulate one entry per
+// unique chunk of text it has ever scanned, forever.
+const MAX_CACHED_EMBEDDINGS = 5_000;
+
 const DEFAULT_IGNORED_DIRECTORIES = new Set([
   ".git",
   ".deleted",
@@ -36,11 +47,7 @@ export class RagService {
     this.embeddingClient = createEmbeddingClient(config);
   }
 
-  async buildContext(
-    agent: Agent,
-    prompt: string,
-    excludeRunId: string | null,
-  ): Promise<RagContext> {
+  async buildContext(agent: Agent, prompt: string): Promise<RagContext> {
     const [workspaceChunks, sharedChunks] = await Promise.all([
       this.collectFilesystemChunks(agent.workspacePath, "workspace", agent.id),
       this.collectFilesystemChunks(this.config.sharedResourceRoot, "shared", "shared-root"),
@@ -109,26 +116,65 @@ export class RagService {
           this.chunkEmbeddingCache.set(content, embedding);
         }
       });
+      // Map preserves insertion order, so the earliest-inserted (typically
+      // longest-untouched) entries are the ones dropped.
+      while (this.chunkEmbeddingCache.size > MAX_CACHED_EMBEDDINGS) {
+        const oldestKey = this.chunkEmbeddingCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.chunkEmbeddingCache.delete(oldestKey);
+      }
     }
     return candidates.map((candidate) => this.chunkEmbeddingCache.get(candidate.content) ?? []);
   }
 
+  /**
+   * Collects every eligible file under `root` first (cheap: just stats,
+   * no content read), ranks by mtime descending, and only reads/chunks
+   * enough of the newest files to fill `ragScanLimit`. This is what makes
+   * the cap "the N most recently touched chunks" rather than whatever
+   * order the OS's readdir happens to return -- readdir order is not
+   * guaranteed, so truncating mid-walk (the previous approach) silently
+   * dropped content in an effectively arbitrary, non-relevance-based way.
+   */
   private async collectFilesystemChunks(
     root: string,
     sourceType: "workspace" | "shared",
     sourceId: string,
   ): Promise<ChunkCandidate[]> {
+    const eligibleFiles: EligibleFile[] = [];
+    await this.listEligibleFiles(root, eligibleFiles);
+    eligibleFiles.sort((left, right) => right.mtimeMs - left.mtimeMs);
+
     const chunks: ChunkCandidate[] = [];
-    await this.walkDirectory(root, sourceType, sourceId, chunks);
+    for (const file of eligibleFiles) {
+      if (chunks.length >= this.config.ragScanLimit) {
+        break;
+      }
+      let content: string;
+      try {
+        content = await readFile(file.path, "utf8");
+      } catch {
+        continue;
+      }
+      if (!isLikelyText(content)) {
+        continue;
+      }
+      for (const chunk of chunkText(content, this.config.ragChunkSize)) {
+        if (chunks.length >= this.config.ragScanLimit) {
+          break;
+        }
+        chunks.push({
+          sourceType,
+          sourceId,
+          title: file.path,
+          content: chunk,
+        });
+      }
+    }
     return chunks;
   }
 
-  private async walkDirectory(
-    currentPath: string,
-    sourceType: "workspace" | "shared",
-    sourceId: string,
-    chunks: ChunkCandidate[],
-  ): Promise<void> {
+  private async listEligibleFiles(currentPath: string, out: EligibleFile[]): Promise<void> {
     let entries;
     try {
       entries = await readdir(currentPath, { withFileTypes: true });
@@ -136,14 +182,11 @@ export class RagService {
       return;
     }
     for (const entry of entries) {
-      if (chunks.length >= this.config.ragScanLimit) {
-        return;
-      }
       if (entry.isDirectory()) {
         if (DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) {
           continue;
         }
-        await this.walkDirectory(path.join(currentPath, entry.name), sourceType, sourceId, chunks);
+        await this.listEligibleFiles(path.join(currentPath, entry.name), out);
         continue;
       }
       if (!entry.isFile() || DEFAULT_IGNORED_FILES.has(entry.name)) {
@@ -156,29 +199,14 @@ export class RagService {
       } catch {
         continue;
       }
-      if (fileStat.size > 256_000) {
+      // Kept in sync with the same limit enforced at upload time
+      // (AgentService.uploadAgentResource/uploadSharedResource) -- a file
+      // too big to ever be scanned is rejected loudly there instead of
+      // accepted here and then silently never surfaced.
+      if (fileStat.size > this.config.ragMaxFileBytes) {
         continue;
       }
-      let content: string;
-      try {
-        content = await readFile(filePath, "utf8");
-      } catch {
-        continue;
-      }
-      if (!isLikelyText(content)) {
-        continue;
-      }
-      for (const chunk of chunkText(content, this.config.ragChunkSize)) {
-        chunks.push({
-          sourceType,
-          sourceId,
-          title: filePath,
-          content: chunk,
-        });
-        if (chunks.length >= this.config.ragScanLimit) {
-          return;
-        }
-      }
+      out.push({ path: filePath, mtimeMs: fileStat.mtimeMs });
     }
   }
 }

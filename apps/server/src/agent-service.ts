@@ -648,6 +648,28 @@ export class AgentService {
     return agent;
   }
 
+  /** Resolves a stored user id back into a fresh `AuthUser`, re-read from
+   * the store every time (never cached) so a role change or Grant edit
+   * takes effect on the very next call, same as `assertAccess` itself.
+   * Returns null both for a genuinely absent id (single-user baseline) and
+   * for an id that doesn't resolve to a real user -- the latter only ever
+   * happens for `UNCLAIMED_OWNER_ID` today, whose "visible platform-wide"
+   * behavior is exactly what falling through to a null actor already gives
+   * `listAgents`/`rosterVisibleTo`. */
+  private resolveActorById(userId: string | null): AuthUser | null {
+    if (!userId) return null;
+    const user = this.store.snapshot().users.find((item) => item.id === userId);
+    return user ? { id: user.id, name: user.name, role: user.role } : null;
+  }
+
+  /** The Agent roster a given user id can actually reach, for baking into
+   * an Agent's own AGENTS.md or for validating a delegation target -- never
+   * the full unfiltered platform roster once identity is active. See
+   * `AgentRun.actorId`'s doc comment for why this exists. */
+  private rosterVisibleTo(userId: string | null): Array<Agent & { myRole: EffectiveRole | null }> {
+    return this.listAgents(this.resolveActorById(userId));
+  }
+
   async createAgent(input: CreateAgentInput, ownerId: string = UNCLAIMED_OWNER_ID): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
@@ -668,7 +690,7 @@ export class AgentService {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    await this.workspaces.create(agent, this.listAgents());
+    await this.workspaces.create(agent, this.rosterVisibleTo(ownerId));
     await this.store.mutate((database) => database.agents.push(agent));
     return agent;
   }
@@ -725,7 +747,7 @@ export class AgentService {
       agent.updatedAt = now();
       return structuredClone(agent);
     });
-    await this.workspaces.writeInstructions(updated, this.listAgents());
+    await this.workspaces.writeInstructions(updated, this.rosterVisibleTo(updated.ownerId));
     return updated;
   }
 
@@ -761,7 +783,39 @@ export class AgentService {
     input: UploadInput,
   ): Promise<{ name: string; size: number; updatedAt: string }> {
     const content = (await normalizeUploadContent(input)).trim();
+    this.assertIndexableContent(content, "Shared resource");
     return this.sharedResources.write(input.name, content);
+  }
+
+  /**
+   * Both upload endpoints exist specifically to feed the RAG corpus (see
+   * the UI copy: "add it to this Agent's RAG corpus" / "Available to all
+   * authorized agents via RAG") -- a file too large or too obviously
+   * non-text to ever actually be scanned by RagService.collectFilesystemChunks
+   * would otherwise be accepted, sit on disk, and silently never do the one
+   * thing it was uploaded for. Rejecting it here, loudly, at upload time is
+   * the honest behavior; the size threshold is the exact same
+   * config.ragMaxFileBytes RagService itself skips past when scanning, so
+   * this can never reject something RAG would have picked up anyway (or
+   * vice versa).
+   */
+  private assertIndexableContent(content: string, label: string): void {
+    if (Buffer.byteLength(content, "utf8") > this.config.ragMaxFileBytes) {
+      throw new HttpError(
+        400,
+        label +
+          " exceeds the maximum size that can be indexed for retrieval (" +
+          this.config.ragMaxFileBytes +
+          " bytes). Reduce the file size and try again.",
+      );
+    }
+    if (content.includes(String.fromCharCode(0))) {
+      throw new HttpError(
+        400,
+        label +
+          " doesn't look like plain text (contains a NUL byte) -- only text/Markdown and PDF uploads are supported.",
+      );
+    }
   }
 
   async deleteSharedResource(name: string): Promise<void> {
@@ -783,6 +837,7 @@ export class AgentService {
   ): Promise<{ name: string; size: number; updatedAt: string }> {
     this.getAgent(agentId, actor, "write");
     const content = (await normalizeUploadContent(input)).trim();
+    this.assertIndexableContent(content, "Upload");
     return this.workspaces.writeUpload(agentId, input.name, content);
   }
 
@@ -879,7 +934,7 @@ export class AgentService {
         "OpenRouter is not configured. Set OPENROUTER_API_KEY and OPENROUTER_MODEL, then restart.",
       );
     }
-    const outcome = await this.createRunAtomic(agentId, prompt, null);
+    const outcome = await this.createRunAtomic(agentId, prompt, null, actor?.id ?? null);
     if (outcome.kind === "short-circuited") {
       // The Agent is over its token budget or already mid-run -- a real,
       // completed Run + assistant reply was still persisted (visible in
@@ -954,6 +1009,7 @@ export class AgentService {
     targetAgentId: string,
     prompt: string,
     parentRunId: string | null,
+    actorId: string | null,
   ): Promise<
     | {
         kind: "started";
@@ -994,6 +1050,10 @@ export class AgentService {
       partial: false,
       runnerHandle: null,
       parentRunId,
+      // Only stamped on the root of a delegation tree -- see the field's
+      // doc comment in types.ts. A delegated child Run always resolves its
+      // visibility via `findRootRun`, never its own `actorId`.
+      actorId: parentRunId === null ? actorId : null,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
       retrieval: null,
@@ -1092,7 +1152,7 @@ export class AgentService {
 
     let ragContext: RagContext;
     try {
-      ragContext = await this.ragService.buildContext(result.agentAtStart, normalizedPrompt, runId);
+      ragContext = await this.ragService.buildContext(result.agentAtStart, normalizedPrompt);
     } catch {
       ragContext = {
         prompt: normalizedPrompt,
@@ -1146,7 +1206,9 @@ export class AgentService {
     targetAgent: Agent,
     task: string,
   ): Promise<AgentRun> {
-    const outcome = await this.createRunAtomic(targetAgent.id, task, parentRun.id);
+    // actorId is discarded for a non-root Run (see createRunAtomic above) --
+    // a delegated child always resolves visibility via findRootRun instead.
+    const outcome = await this.createRunAtomic(targetAgent.id, task, parentRun.id, null);
     if (outcome.kind === "short-circuited") {
       return outcome.run;
     }
@@ -1161,7 +1223,12 @@ export class AgentService {
     parentRun: AgentRun,
     targetName: string,
   ): Promise<{ ok: true; target: Agent } | { ok: false; reason: string }> {
-    const roster = this.listAgents();
+    // The actual authorization gate: only Agents the ORIGINAL human actor
+    // who started this delegation tree can reach are eligible targets --
+    // never the full platform roster, and never whatever the delegating
+    // Agent's own owner happens to see. See AgentRun.actorId's doc comment.
+    const rootActorId = findRootRun(parentRun, this.store.snapshot().runs).actorId;
+    const roster = this.rosterVisibleTo(rootActorId);
     const target = roster.find(
       (agent) => agent.name.trim().toLowerCase() === targetName.trim().toLowerCase(),
     );
@@ -1454,7 +1521,7 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
-    const initialPrompt = this.withFreshRosterReminder(agentAtStart, ragContext.prompt);
+    const initialPrompt = this.withFreshRosterReminder(agentAtStart, run, ragContext.prompt);
     await this.runOrchestrationLoop(run.agentId, run.id, initialPrompt, agentAtStart.codexThreadId);
   }
 
@@ -1468,9 +1535,10 @@ export class AgentService {
    * AGENTS.md fresh as part of starting up -- and only when there's
    * actually another Agent to delegate to.
    */
-  private withFreshRosterReminder(agentAtStart: Agent, prompt: string): string {
+  private withFreshRosterReminder(agentAtStart: Agent, run: AgentRun, prompt: string): string {
     if (!agentAtStart.codexThreadId) return prompt;
-    const roster = this.listAgents();
+    const rootActorId = findRootRun(run, this.store.snapshot().runs).actorId;
+    const roster = this.rosterVisibleTo(rootActorId);
     if (roster.length <= 1) return prompt;
     return (
       "[Current Agent roster -- this may have changed since your last turn]\n" +
@@ -1524,7 +1592,8 @@ export class AgentService {
       }
 
       // Keep AGENTS.md (roster + delegation contract) current for every turn.
-      await this.workspaces.writeInstructions(this.getAgent(agentId), this.listAgents());
+      const currentAgent = this.getAgent(agentId);
+      await this.workspaces.writeInstructions(currentAgent, this.rosterVisibleTo(currentAgent.ownerId));
 
       let result: RunnerResult;
       try {

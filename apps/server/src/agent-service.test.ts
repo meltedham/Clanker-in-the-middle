@@ -399,6 +399,7 @@ describe("Run interruption and recovery", () => {
       partial: false,
       runnerHandle: "container:launchpad-default-agent-restart",
       parentRunId: null,
+      actorId: null,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
       retrieval: null,
@@ -481,6 +482,7 @@ describe("Run interruption and recovery", () => {
       partial: true,
       runnerHandle: "pid:12345",
       parentRunId: null,
+      actorId: null,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
       retrieval: null,
@@ -563,6 +565,45 @@ describe("Multi-agent delegation", () => {
     const researcherMessages = service.getMessages(researcher.id);
     expect(researcherMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(researcherMessages[0]?.content).toBe("find X");
+  });
+
+  it("does not let a delegation reach an Agent the triggering user has no access to", async () => {
+    // Regression for a real cross-branch bug: delegation was built before
+    // per-user ownership/Grants existed, and kept calling listAgents() with
+    // no actor after access control was merged in -- which listAgents's own
+    // contract treats as "see everything, like an admin". That let any
+    // user's Agent delegate to literally any other user's Agent by name.
+    const runner = new ScriptedRunner((_request, callNumber) => {
+      if (callNumber === 1) {
+        return {
+          output: "I'll ask Target.\n\n" + delegateBlock("Target", "steal secrets"),
+          threadId: "orchestrator-thread-1",
+          usage: null,
+        };
+      }
+      return { output: "gave up", threadId: "orchestrator-thread-1", usage: null };
+    });
+    const service = await makeService(runner);
+
+    // The very first user ever becomes admin automatically (bootstrap), so
+    // create a throwaway one first -- Alice and Bob must both be ordinary
+    // members with no special access to each other's Agents.
+    await service.createUser("Bootstrap-Admin");
+    const { user: alice } = await service.createUser("Alice");
+    const { user: bob } = await service.createUser("Bob");
+
+    const orchestrator = await service.createAgent({ name: "Orchestrator" }, alice.id);
+    const target = await service.createAgent({ name: "Target" }, bob.id);
+    // No Grant from Bob to Alice (or to Alice's Agent) exists anywhere.
+
+    const { run } = await service.sendMessage(orchestrator.id, "kick off orchestration", alice);
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    // Target never actually ran -- the delegation was rejected before a
+    // child Run was ever created, exactly like delegating to a nonexistent
+    // Agent name.
+    expect(service.getRuns(target.id)).toHaveLength(0);
+    expect(service.getRun(run.id).output).toBe("gave up");
   });
 
   it("reminds a resumed thread of the current roster, since Codex does not reliably re-read AGENTS.md on resume", async () => {
@@ -926,6 +967,7 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       partial: false,
       runnerHandle: "container:launchpad-default-orchestrator",
       parentRunId: null,
+      actorId: null,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
       retrieval: null,
@@ -1037,6 +1079,7 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       partial: true,
       runnerHandle: null,
       parentRunId: null,
+      actorId: null,
       awaitingChildRunId: "child-run",
       orchestrationIterationCount: 1,
       retrieval: null,
@@ -1058,6 +1101,7 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       partial: false,
       runnerHandle: "container:launchpad-default-child-agent",
       parentRunId: "parent-run",
+      actorId: null,
       awaitingChildRunId: null,
       orchestrationIterationCount: 0,
       retrieval: null,

@@ -22,8 +22,10 @@ function makeRun(overrides: Partial<AgentRun> & { id: string; agentId: string })
     partial: false,
     runnerHandle: null,
     parentRunId: null,
+    actorId: null,
     awaitingChildRunId: null,
     orchestrationIterationCount: 0,
+    retrieval: null,
     ...overrides,
   };
 }

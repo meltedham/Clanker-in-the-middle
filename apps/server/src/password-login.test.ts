@@ -38,7 +38,7 @@ afterEach(async () => {
   );
 });
 
-async function makeApp() {
+async function makeApp(envOverrides: Record<string, string> = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-password-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -48,6 +48,7 @@ async function makeApp() {
     CODEX_HOME: path.join(root, "codex"),
     OPENROUTER_API_KEY: "test-key",
     OPENROUTER_MODEL: "test-model",
+    ...envOverrides,
   });
   const service = new AgentService(
     config,
@@ -169,6 +170,34 @@ describe("Password login", () => {
       payload: { name: "Alice", password: "another-password-here" },
     });
     expect(duplicate.statusCode).toBe(409);
+
+    await app.close();
+  });
+
+  it("rate-limits repeated login attempts from the same source", async () => {
+    const app = await makeApp({
+      LOGIN_RATE_LIMIT_MAX: "2",
+      LOGIN_RATE_LIMIT_WINDOW_MS: "60000",
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/users",
+      payload: { name: "Alice", password: "correct-horse-battery" },
+    });
+
+    const attempt = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/login",
+        payload: { name: "Alice", password: "wrong-password-entirely" },
+      });
+
+    expect((await attempt()).statusCode).toBe(401);
+    expect((await attempt()).statusCode).toBe(401);
+    // The 3rd attempt within the window is throttled before it ever reaches
+    // the password check -- this is what actually stops a brute-force loop,
+    // not just the 401 responses above.
+    expect((await attempt()).statusCode).toBe(429);
 
     await app.close();
   });
