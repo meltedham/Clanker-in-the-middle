@@ -1285,6 +1285,21 @@ select:focus {
   padding-bottom: 4px;
 }
 
+.trace-run-divider {
+  margin: 8px 0 2px;
+  padding-top: 6px;
+  border-top: 1px solid #e1dfd8;
+  color: #6954d9;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.trace-run-divider:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
 .trace-seq {
   color: #96968f;
   min-width: 16px;
