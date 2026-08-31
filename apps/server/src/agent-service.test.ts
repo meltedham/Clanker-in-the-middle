@@ -267,6 +267,58 @@ describe("Agent lifecycle", () => {
     await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
   });
 
+  it("runs two different Agents concurrently -- the second's runner call is never blocked behind the first's", async () => {
+    let resolveA!: (result: RunnerResult) => void;
+    let resolveB!: (result: RunnerResult) => void;
+    const pendingA = new Promise<RunnerResult>((resolve) => {
+      resolveA = resolve;
+    });
+    const pendingB = new Promise<RunnerResult>((resolve) => {
+      resolveB = resolve;
+    });
+    let agentAId = "";
+    let calledA = false;
+    let calledB = false;
+    const runner: AgentRunner = {
+      run: (request) => {
+        if (request.agentId === agentAId) {
+          calledA = true;
+          return pendingA;
+        }
+        calledB = true;
+        return pendingB;
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async () => ({ stillRunning: false, reason: "not reachable in this fake" }),
+    };
+    const service = await makeService(runner);
+    const agentA = await service.createAgent({ name: "Alpha" });
+    const agentB = await service.createAgent({ name: "Beta" });
+    agentAId = agentA.id;
+
+    const [sendA, sendB] = await Promise.all([
+      service.sendMessage(agentA.id, "work A"),
+      service.sendMessage(agentB.id, "work B"),
+    ]);
+
+    // Both runner calls must actually be in flight at once -- if execution
+    // were secretly serialized across Agents (e.g. a global lock instead
+    // of the per-Agent one this design uses), calledB would still be
+    // false here since Agent A's own pending promise hasn't resolved yet.
+    await expect.poll(() => calledA && calledB).toBe(true);
+    expect(service.getAgent(agentA.id).status).toBe("busy");
+    expect(service.getAgent(agentB.id).status).toBe("busy");
+
+    resolveA({ output: "done A", threadId: "tA", usage: null });
+    resolveB({ output: "done B", threadId: "tB", usage: null });
+
+    await expect.poll(() => service.getRun(sendA.run.id).status).toBe("completed");
+    await expect.poll(() => service.getRun(sendB.run.id).status).toBe("completed");
+    expect(service.getRun(sendA.run.id).output).toBe("done A");
+    expect(service.getRun(sendB.run.id).output).toBe("done B");
+  });
+
   it("does not let start reset a busy Agent, and replies gracefully instead of double-running a second message", async () => {
     let finish!: (result: RunnerResult) => void;
     const pending = new Promise<RunnerResult>((resolve) => {
@@ -435,7 +487,7 @@ describe("Run interruption and recovery", () => {
     expect(service.getAgent("agent-restart").status).toBe("ready");
   });
 
-  it("keeps a checkpointed partial result when reconciliation cannot find the run alive", async () => {
+  it("automatically resumes the task on the same thread when reconciliation cannot find the run alive", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
     temporaryDirectories.push(root);
     const config = loadConfig({
@@ -490,9 +542,11 @@ describe("Run interruption and recovery", () => {
       database.runs.push(run);
     });
 
+    let resumeCallArgs: RunnerRequest | null = null;
     const runner: AgentRunner = {
-      run: async () => {
-        throw new Error("initialize() must reconcile the existing run, not start a new one");
+      run: async (request): Promise<RunnerResult> => {
+        resumeCallArgs = request;
+        return { output: "finished after resuming", threadId: "thread-before-crash", usage: null };
       },
       cancel: async () => false,
       isAvailable: async () => true,
@@ -508,13 +562,178 @@ describe("Run interruption and recovery", () => {
     const service = new AgentService(config, store, workspaces, runner);
     await service.initialize();
 
+    // The task is not declared dead -- it's automatically re-run to
+    // completion using the checkpointed thread id, not a blank slate.
+    expect(resumeCallArgs).not.toBeNull();
+    expect(resumeCallArgs!.threadId).toBe("thread-before-crash");
+    expect(resumeCallArgs!.prompt).toContain("checkpointed partial text");
+    expect(resumeCallArgs!.prompt).toContain("do work that does not survive");
+
     const finishedRun = service.getRun("run-gone");
-    expect(finishedRun.status).toBe("cancelled");
-    expect(finishedRun.error).toBe("Local-process Runs cannot be reattached after a server restart");
-    // The checkpointed partial output/thread id from before the crash must survive.
-    expect(finishedRun.output).toBe("checkpointed partial text");
-    expect(finishedRun.partial).toBe(true);
+    expect(finishedRun.status).toBe("completed");
+    expect(finishedRun.output).toBe("finished after resuming");
+    expect(service.getAgent("agent-gone").status).toBe("ready");
     expect(service.getAgent("agent-gone").codexThreadId).toBe("thread-before-crash");
+  });
+
+  it("resends the original prompt verbatim when nothing had streamed back before the crash", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
+    });
+    const store = new JsonStore(path.join(root, "data", "db.json"));
+    const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
+    await store.initialize();
+    await workspaces.initialize();
+
+    const agent: Agent = {
+      id: "agent-never-started",
+      name: "NeverStarted",
+      description: "",
+      instructions: "",
+      status: "busy",
+      ownerId: "unclaimed",
+      sandboxMode: "workspace-write",
+      networkAccess: true,
+      workspacePath: workspaces.workspacePath("agent-never-started"),
+      codexThreadId: null,
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    await workspaces.create(agent, [agent]);
+    const run: AgentRun = {
+      id: "run-never-started",
+      agentId: "agent-never-started",
+      status: "queued",
+      prompt: "the original task",
+      output: null,
+      error: null,
+      usage: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      partial: false,
+      runnerHandle: null,
+      parentRunId: null,
+      actorId: null,
+      awaitingChildRunId: null,
+      orchestrationIterationCount: 0,
+      retrieval: null,
+    };
+    await store.mutate((database) => {
+      database.agents.push(agent);
+      database.runs.push(run);
+    });
+
+    let resumeCallArgs: RunnerRequest | null = null;
+    const runner: AgentRunner = {
+      run: async (request): Promise<RunnerResult> => {
+        resumeCallArgs = request;
+        return { output: "done", threadId: "thread-fresh", usage: null };
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async (): Promise<ReconcileOutcome> => ({
+        stillRunning: false,
+        reason: "Local-process Runs cannot be reattached after a server restart",
+      }),
+    };
+
+    const service = new AgentService(config, store, workspaces, runner);
+    await service.initialize();
+
+    expect(resumeCallArgs).not.toBeNull();
+    expect(resumeCallArgs!.prompt).toBe("the original task");
+    expect(service.getRun("run-never-started").status).toBe("completed");
+  });
+
+  it("gives up retrying across restarts once the tree-wide iteration cap is hit, instead of looping forever", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
+    temporaryDirectories.push(root);
+    const config = loadConfig({
+      NODE_ENV: "test",
+      APP_DATA_DIR: path.join(root, "data"),
+      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
+      CODEX_HOME: path.join(root, "codex"),
+      OPENROUTER_API_KEY: "test-key",
+      OPENROUTER_MODEL: "openai/gpt-4o-mini",
+    });
+    const store = new JsonStore(path.join(root, "data", "db.json"));
+    const workspaces = new WorkspaceManager(path.join(root, "workspaces"));
+    await store.initialize();
+    await workspaces.initialize();
+
+    const agent: Agent = {
+      id: "agent-always-crashes",
+      name: "AlwaysCrashes",
+      description: "",
+      instructions: "",
+      status: "busy",
+      ownerId: "unclaimed",
+      sandboxMode: "workspace-write",
+      networkAccess: true,
+      workspacePath: workspaces.workspacePath("agent-always-crashes"),
+      codexThreadId: null,
+      lastError: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+    await workspaces.create(agent, [agent]);
+    const run: AgentRun = {
+      id: "run-always-crashes",
+      agentId: "agent-always-crashes",
+      status: "running",
+      prompt: "a task whose environment always crashes",
+      output: null,
+      error: null,
+      usage: null,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      completedAt: null,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      partial: false,
+      runnerHandle: null,
+      parentRunId: null,
+      actorId: null,
+      // Already at the cap from earlier restarts each consuming one unit --
+      // this boot's reconciliation should refuse to even try the runner
+      // again.
+      orchestrationIterationCount: 10,
+      retrieval: null,
+    };
+    await store.mutate((database) => {
+      database.agents.push(agent);
+      database.runs.push(run);
+    });
+
+    const runner: AgentRunner = {
+      run: async () => {
+        throw new Error("initialize() must not call the runner once the iteration cap is already spent");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+      reconcile: async (): Promise<ReconcileOutcome> => ({
+        stillRunning: false,
+        reason: "gone",
+      }),
+    };
+
+    const service = new AgentService(config, store, workspaces, runner);
+    await service.initialize();
+
+    const finishedRun = service.getRun("run-always-crashes");
+    // The very next attempt trips the cap before calling the runner again,
+    // so it finalizes as a (successful, capped) completion rather than
+    // "failed" -- consistent with how the same cap already finalizes a
+    // runaway delegation loop.
+    expect(finishedRun.status).toBe("completed");
+    expect(finishedRun.output).toContain("Orchestration round limit reached");
   });
 });
 

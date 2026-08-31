@@ -164,6 +164,7 @@ export default function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [whoami, setWhoami] = useState<AuthUser | null>(null);
   const [showShare, setShowShare] = useState(false);
+  const [showResources, setShowResources] = useState(false);
   const [grants, setGrants] = useState<Grant[]>([]);
   const [users, setUsers] = useState<Array<{ id: string; name: string }>>([]);
   const [shareUserId, setShareUserId] = useState("");
@@ -171,6 +172,11 @@ export default function App() {
   const [allUsers, setAllUsers] = useState<Array<{ id: string; name: string }>>([]);
   const [policySandboxMode, setPolicySandboxMode] = useState<SandboxMode>("workspace-write");
   const messageEnd = useRef<HTMLDivElement>(null);
+  const messagesContainer = useRef<HTMLDivElement>(null);
+  // Only auto-scroll while the user is already at (or near) the bottom, so a
+  // running Agent's poll ticks don't yank someone back down after they've
+  // scrolled up to read earlier messages.
+  const stickToBottom = useRef(true);
   const selectedIdRef = useRef<string | null>(null);
   const activeRunRef = useRef<AgentRun | null>(null);
   const mountedRef = useRef(true);
@@ -336,6 +342,7 @@ export default function App() {
     setActiveRun(null);
     setShowSettings(false);
     setShowShare(false);
+    setShowResources(false);
     setShowTrace(false);
     setTraceEvents(null);
     setConnectionState("connected");
@@ -373,10 +380,16 @@ export default function App() {
   useEffect(() => {
     setUploadFile(null);
     setUploadForm(emptyResourceForm);
+    // Switching agents is a fresh conversation view -- always land at the
+    // bottom (the latest message) rather than wherever the previous agent's
+    // scroll position happened to be.
+    stickToBottom.current = true;
   }, [selectedId]);
 
   useEffect(() => {
-    messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    if (stickToBottom.current) {
+      messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages, activeRun]);
 
   useEffect(() => {
@@ -517,6 +530,7 @@ export default function App() {
     if (!selected) return;
     setShowShare(true);
     setShowSettings(false);
+    setShowResources(false);
     setError(null);
     try {
       const [grantsResult, usersResult] = await Promise.all([
@@ -1193,8 +1207,20 @@ export default function App() {
                 <button
                   className="button button-ghost"
                   onClick={() => {
+                    setShowResources((value) => !value);
+                    setShowSettings(false);
+                    setShowShare(false);
+                  }}
+                  disabled={busy}
+                >
+                  Resources
+                </button>
+                <button
+                  className="button button-ghost"
+                  onClick={() => {
                     setShowSettings((value) => !value);
                     setShowShare(false);
+                    setShowResources(false);
                   }}
                   disabled={busy || selected.status === "busy"}
                 >
@@ -1228,7 +1254,12 @@ export default function App() {
             </header>
 
             {showSettings && (
-              <form className="settings-panel" onSubmit={saveAgent}>
+              <div className="modal-backdrop" onMouseDown={() => setShowSettings(false)}>
+              <form
+                className="modal settings-panel"
+                onSubmit={saveAgent}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
                 <div className="settings-title">
                   <div>
                     <span className="eyebrow">Agent configuration</span>
@@ -1350,10 +1381,16 @@ export default function App() {
                   )}
                 </div>
               </form>
+              </div>
             )}
 
             {showShare && (
-              <form className="settings-panel" onSubmit={submitShare}>
+              <div className="modal-backdrop" onMouseDown={() => setShowShare(false)}>
+              <form
+                className="modal settings-panel"
+                onSubmit={submitShare}
+                onMouseDown={(event) => event.stopPropagation()}
+              >
                 <div className="settings-title">
                   <div>
                     <span className="eyebrow">Access control</span>
@@ -1432,9 +1469,20 @@ export default function App() {
                   </button>
                 </div>
               </form>
+              </div>
             )}
 
-            <section className="resource-grid">
+            {showResources && (
+              <div className="modal-backdrop" onMouseDown={() => setShowResources(false)}>
+              <div className="modal modal-wide" onMouseDown={(event) => event.stopPropagation()}>
+                <div className="settings-title">
+                  <div>
+                    <span className="eyebrow">Context</span>
+                    <h2>Workspace &amp; shared resources</h2>
+                  </div>
+                  <button type="button" onClick={() => setShowResources(false)}>×</button>
+                </div>
+                <section className="resource-grid">
               <form className="resource-panel" onSubmit={uploadWorkspaceResource}>
                 <div className="resource-panel-heading">
                   <div>
@@ -1604,7 +1652,10 @@ export default function App() {
                   </button>
                 </div>
               </form>
-            </section>
+                </section>
+              </div>
+              </div>
+            )}
 
             <section className="playground">
               <div className="playground-topbar">
@@ -1647,7 +1698,16 @@ export default function App() {
                 </div>
               )}
 
-              <div className="messages">
+              <div
+                className="messages"
+                ref={messagesContainer}
+                onScroll={() => {
+                  const el = messagesContainer.current;
+                  if (!el) return;
+                  stickToBottom.current =
+                    el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+                }}
+              >
                 {messages.length === 0 && !activeRun ? (
                   <div className="welcome">
                     <div className="welcome-orbit">

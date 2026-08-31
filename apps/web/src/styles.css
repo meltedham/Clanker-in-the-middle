@@ -23,7 +23,8 @@
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .auth-screen {
@@ -398,7 +399,9 @@ button {
 .main {
   min-width: 0;
   height: 100vh;
-  overflow-y: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   padding: 22px 34px 34px;
   background:
     radial-gradient(circle at 86% -10%, rgba(105, 84, 217, 0.09), transparent 30%),
@@ -409,6 +412,8 @@ button {
 .error-banner,
 .connection-banner {
   max-width: 1180px;
+  width: 100%;
+  flex-shrink: 0;
   margin: 0 auto 14px;
   display: flex;
   align-items: center;
@@ -479,6 +484,8 @@ button {
 
 .agent-header {
   max-width: 1180px;
+  width: 100%;
+  flex-shrink: 0;
   margin: 0 auto 18px;
   min-height: 78px;
   display: flex;
@@ -718,9 +725,9 @@ button {
   font-weight: 600;
 }
 
-.settings-panel,
 .playground {
   max-width: 1180px;
+  width: 100%;
   margin-left: auto;
   margin-right: auto;
   background: var(--paper);
@@ -728,9 +735,13 @@ button {
   box-shadow: 0 12px 36px rgba(43, 42, 38, 0.06);
 }
 
+/* Settings, Share, and Resources all now live inside a .modal overlay
+   (see .modal-backdrop) instead of sitting inline above the playground --
+   that's what keeps the base page height-locked to the viewport (see
+   body/.app-shell/.main) with no page-level scrollbar in the common case,
+   while these occasional editing panels still get their own scroll region
+   if their content is taller than the modal. */
 .resource-grid {
-  max-width: 1180px;
-  margin: 0 auto 14px;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
@@ -799,11 +810,9 @@ button {
   font-size: 12px;
 }
 
-.settings-panel {
-  padding: 20px;
-  border-radius: 14px;
-  margin-bottom: 14px;
-}
+/* .settings-panel is combined with .modal on the same element (Settings
+   and Share both reuse this form styling) -- .modal already supplies
+   width/padding/border-radius/background/shadow/max-height. */
 
 .settings-title,
 .modal-heading {
@@ -929,8 +938,11 @@ select:focus {
 }
 
 .playground {
-  height: calc(100vh - 150px);
-  min-height: 560px;
+  /* Fills whatever height .main has left after the header (and any
+     banners) -- .main is a fixed-height (100vh) flex column, so this
+     never pushes the page taller than the viewport. */
+  flex: 1;
+  min-height: 0;
   border-radius: 17px;
   overflow: hidden;
   display: grid;
@@ -1364,7 +1376,8 @@ select:focus {
 }
 
 .no-agent {
-  min-height: calc(100vh - 60px);
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1412,11 +1425,19 @@ select:focus {
 
 .modal {
   width: min(560px, 100%);
+  /* Content taller than this scrolls inside the modal itself -- the page
+     behind it (see .modal-backdrop) never needs to grow or scroll. */
+  max-height: min(88vh, 760px);
+  overflow-y: auto;
   border: 1px solid rgba(255, 255, 255, 0.55);
   border-radius: 18px;
   background: var(--paper);
   padding: 25px;
   box-shadow: var(--shadow);
+}
+
+.modal-wide {
+  width: min(920px, 96vw);
 }
 
 .modal-heading h2 {
@@ -1506,6 +1527,15 @@ select:focus {
 }
 
 @media (max-width: 680px) {
+  /* Below this width the shell stacks (sidebar becomes a top bar, see
+     below) instead of a fixed two-column layout -- the "everything fits
+     without scrolling" constraint only makes sense for a real desktop
+     viewport, so restore ordinary page scrolling here. */
+  body {
+    height: auto;
+    overflow: visible;
+  }
+
   .app-shell {
     display: block;
     height: auto;
