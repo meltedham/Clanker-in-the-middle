@@ -173,6 +173,11 @@ export default function App() {
   const [policySandboxMode, setPolicySandboxMode] = useState<SandboxMode>("workspace-write");
   const [policyNetworkAccess, setPolicyNetworkAccess] = useState(true);
   const messageEnd = useRef<HTMLDivElement>(null);
+  const messagesContainer = useRef<HTMLDivElement>(null);
+  // Only auto-scroll while the user is already at (or near) the bottom, so a
+  // running Agent's poll ticks don't yank someone back down after they've
+  // scrolled up to read earlier messages.
+  const stickToBottom = useRef(true);
   const selectedIdRef = useRef<string | null>(null);
   const activeRunRef = useRef<AgentRun | null>(null);
   const mountedRef = useRef(true);
@@ -377,10 +382,16 @@ export default function App() {
   useEffect(() => {
     setUploadFile(null);
     setUploadForm(emptyResourceForm);
+    // Switching agents is a fresh conversation view -- always land at the
+    // bottom (the latest message) rather than wherever the previous agent's
+    // scroll position happened to be.
+    stickToBottom.current = true;
   }, [selectedId]);
 
   useEffect(() => {
-    messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    if (stickToBottom.current) {
+      messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages, activeRun]);
 
   useEffect(() => {
@@ -1705,7 +1716,16 @@ export default function App() {
                 </div>
               )}
 
-              <div className="messages">
+              <div
+                className="messages"
+                ref={messagesContainer}
+                onScroll={() => {
+                  const el = messagesContainer.current;
+                  if (!el) return;
+                  stickToBottom.current =
+                    el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+                }}
+              >
                 {messages.length === 0 && !activeRun ? (
                   <div className="welcome">
                     <div className="welcome-orbit">
