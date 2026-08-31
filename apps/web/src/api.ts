@@ -116,7 +116,6 @@ export const api = {
       // Only ever sent when the caller can see the runtime-policy controls
       // (owner/admin) -- AgentService still re-checks this itself either way.
       sandboxMode?: SandboxMode;
-      networkAccess?: boolean;
     },
   ) =>
     request<{ agent: Agent }>("/api/agents/" + id, {

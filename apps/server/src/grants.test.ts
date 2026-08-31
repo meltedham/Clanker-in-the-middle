@@ -340,7 +340,7 @@ describe("Grants: viewer vs operator", () => {
     await app.close();
   });
 
-  it("an operator cannot change sandbox/network policy -- only the owner or an admin can", async () => {
+  it("an operator cannot change sandbox policy -- only the owner or an admin can", async () => {
     const app = await makeApp();
     const owner = await createUser(app, "Owner"); // admin, by bootstrap
     const operator = await createUser(app, "Operator", owner.token);
@@ -382,12 +382,11 @@ describe("Grants: viewer vs operator", () => {
       method: "PATCH",
       url: `/api/agents/${agentId}`,
       headers: authHeader(owner.token),
-      payload: { sandboxMode: "read-only", networkAccess: false },
+      payload: { sandboxMode: "read-only" },
     });
     expect(ownerPatch.statusCode).toBe(200);
     const ownerBody = JSON.parse(ownerPatch.body);
     expect(ownerBody.agent.sandboxMode).toBe("read-only");
-    expect(ownerBody.agent.networkAccess).toBe(false);
     await app.close();
   });
 
@@ -581,6 +580,44 @@ describe("Grants: viewer vs operator", () => {
     expect(grantList).toEqual([
       { id: "admin:" + admin.user.id, userId: admin.user.id, userName: "Admin", role: "admin", revocable: false, createdAt: expect.any(String) },
     ]);
+    await app.close();
+  });
+
+  it("refuses to grant a role to the Agent's own owner -- picking the wrong name while sharing someone else's Agent as admin", async () => {
+    const app = await makeApp();
+    const admin = await createUser(app, "Admin"); // admin by bootstrap
+    const owner = await createUser(app, "Owner", admin.token);
+    await createUser(app, "Intended Grantee", admin.token);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/agents",
+      headers: authHeader(owner.token),
+      payload: { name: "Owner's Agent" },
+    });
+    const agentId = JSON.parse(created.body).agent.id as string;
+
+    // Only an admin can even reach this mistake: the owner themself is
+    // excluded from the client's own share dropdown when it's their own
+    // Agent (there's no "share with myself" option to pick by accident).
+    const grantAttempt = await app.inject({
+      method: "POST",
+      url: `/api/agents/${agentId}/grants`,
+      headers: authHeader(admin.token),
+      payload: { userId: owner.user.id, role: "viewer" },
+    });
+    expect(grantAttempt.statusCode).toBe(403);
+
+    const grants = await app.inject({
+      method: "GET",
+      url: `/api/agents/${agentId}/grants`,
+      headers: authHeader(admin.token),
+    });
+    const grantList = JSON.parse(grants.body).grants as Array<{ userName: string }>;
+    // No explicit Grant for the owner either -- same reasoning as the
+    // admin case: the owner already has full access before any Grant is
+    // consulted, so a Grant here would just as inert.
+    expect(grantList.some((grant) => grant.userName === "Owner")).toBe(false);
     await app.close();
   });
 

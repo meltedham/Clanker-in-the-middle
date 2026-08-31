@@ -26,7 +26,6 @@ describe("Container Codex runner", () => {
         prompt: "write a small program",
         threadId: null,
         sandboxMode: "workspace-write",
-        networkAccess: true,
       },
       config,
     );
@@ -55,27 +54,6 @@ describe("Container Codex runner", () => {
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
   });
 
-  it("cuts network access per-Agent when networkAccess is false", () => {
-    const config = loadConfig({
-      NODE_ENV: "test",
-      CODEX_HOME: "/tmp/codex-home",
-      RUNTIME_PROVIDER: "container",
-    });
-    const args = buildContainerRunArgs(
-      {
-        agentId: "agent",
-        workspacePath: "/tmp/workspace",
-        prompt: "install a dependency",
-        threadId: null,
-        sandboxMode: "workspace-write",
-        networkAccess: false,
-      },
-      config,
-    );
-    expect(args).toContain("none");
-    expect(args).not.toContain("bridge");
-  });
-
   it("blocks writes per-Agent via read-only sandbox mode", () => {
     const config = loadConfig({
       NODE_ENV: "test",
@@ -89,7 +67,6 @@ describe("Container Codex runner", () => {
         prompt: "just look around",
         threadId: null,
         sandboxMode: "read-only",
-        networkAccess: true,
       },
       config,
     );
@@ -111,7 +88,6 @@ describe("Container Codex runner", () => {
         prompt: "continue",
         threadId: "thread-123",
         sandboxMode: "workspace-write",
-        networkAccess: true,
       },
       config,
     );

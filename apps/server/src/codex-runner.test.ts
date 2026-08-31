@@ -13,7 +13,6 @@ describe("Codex runner protocol", () => {
         prompt: "build a calculator",
         threadId: null,
         sandboxMode: "workspace-write",
-        networkAccess: true,
       },
       "workspace-write",
     );
@@ -22,6 +21,8 @@ describe("Codex runner protocol", () => {
       "--json",
       "--sandbox",
       "workspace-write",
+      "-c",
+      "approval_policy=never",
       "--skip-git-repo-check",
       "-C",
       "/tmp/workspace",
@@ -38,11 +39,32 @@ describe("Codex runner protocol", () => {
         prompt: "add tests",
         threadId: "thread-123",
         sandboxMode: "workspace-write",
-        networkAccess: true,
       },
       "workspace-write",
     );
     expect(args.slice(-3)).toEqual(["resume", "thread-123", "add tests"]);
+  });
+
+  it("never lets the model escalate past a sandbox denial", () => {
+    // `codex exec` defaults to approval_policy "on-request": the model
+    // itself decides when to ask for approval to run outside the sandbox.
+    // In this headless exec context there's no human to approve that
+    // request, so it would otherwise be waved through and silently defeat
+    // sandboxMode. Regression coverage for that gap (see buildCodexArgs).
+    for (const sandboxMode of ["read-only", "workspace-write"] as const) {
+      const args = buildCodexArgs(
+        {
+          agentId: "agent",
+          runId: "run-1",
+          workspacePath: "/tmp/workspace",
+          prompt: "do something",
+          threadId: null,
+          sandboxMode,
+        },
+        sandboxMode,
+      );
+      expect(args).toContain("approval_policy=never");
+    }
   });
 
   it("extracts the session, final message and usage", () => {

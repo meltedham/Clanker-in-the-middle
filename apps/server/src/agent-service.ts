@@ -286,9 +286,6 @@ export class AgentService {
         if (!validSandboxModes.includes(agent.sandboxMode)) {
           agent.sandboxMode = this.config.codexSandboxMode;
         }
-        if (typeof agent.networkAccess !== "boolean") {
-          agent.networkAccess = true;
-        }
         // Back-compat: Agents created before ownership existed have no
         // `ownerId` in their stored JSON. Without this, `undefined` would
         // never match a real user's id in assertAccess -- the moment
@@ -459,6 +456,16 @@ export class AgentService {
           403,
           "Admins already have full access to every Agent and can't be granted a role",
         );
+      }
+      if (granteeUserId === agent.ownerId) {
+        // Same reasoning as the admin case above: the owner check in
+        // assertAccess is checked before any Grant, so a Grant here would be
+        // just as inert -- and, since only the owner/admin can even reach
+        // this method, this only happens when an admin picks the wrong name
+        // while sharing someone else's Agent (the owner is still a valid
+        // user to select from). Reject it before it silently no-ops instead
+        // of granting the person actually intended.
+        throw new HttpError(403, "This Agent's owner already has full access and can't be granted a role");
       }
       const existing = database.grants.find(
         (item) => item.agentId === agentId && item.userId === granteeUserId && !item.revokedAt,
@@ -683,7 +690,6 @@ export class AgentService {
       stopReason: null,
       ownerId,
       sandboxMode: input.sandboxMode ?? this.config.codexSandboxMode,
-      networkAccess: input.networkAccess ?? true,
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
@@ -704,17 +710,11 @@ export class AgentService {
     if (current.status === "busy") {
       throw new HttpError(409, "Stop the active run before editing this Agent");
     }
-    // Runtime policy (sandbox/network) is stricter than ordinary edits: an
+    // Runtime policy (sandbox) is stricter than ordinary edits: an
     // operator Grant lets someone use an Agent, not reconfigure how
     // dangerous it's allowed to be. Only the owner or an admin may change it.
-    if (
-      (input.sandboxMode !== undefined || input.networkAccess !== undefined) &&
-      !this.isOwnerOrAdmin(current, actor)
-    ) {
-      throw new HttpError(
-        403,
-        "Only the Agent's owner or an admin can change its sandbox or network policy",
-      );
+    if (input.sandboxMode !== undefined && !this.isOwnerOrAdmin(current, actor)) {
+      throw new HttpError(403, "Only the Agent's owner or an admin can change its sandbox policy");
     }
     const updated = await this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === id);
@@ -729,7 +729,6 @@ export class AgentService {
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
       if (input.sandboxMode !== undefined) agent.sandboxMode = input.sandboxMode;
-      if (input.networkAccess !== undefined) agent.networkAccess = input.networkAccess;
       if (input.tokenBudget !== undefined) {
         agent.tokenBudget = input.tokenBudget;
         // Raising (or lifting) the budget past what's already been spent
@@ -1565,7 +1564,6 @@ export class AgentService {
     const agentSnapshot = this.getAgent(agentId);
     const workspacePath = agentSnapshot.workspacePath;
     const sandboxMode = agentSnapshot.sandboxMode;
-    const networkAccess = agentSnapshot.networkAccess;
     let prompt = initialPrompt;
     let threadId = initialThreadId;
 
@@ -1598,7 +1596,7 @@ export class AgentService {
       let result: RunnerResult;
       try {
         result = await this.runner.run(
-          { agentId, runId, workspacePath, prompt, threadId, sandboxMode, networkAccess },
+          { agentId, runId, workspacePath, prompt, threadId, sandboxMode },
           this.progressCallbacks(runId, agentId),
         );
       } catch (error) {

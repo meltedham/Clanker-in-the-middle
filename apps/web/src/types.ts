@@ -14,7 +14,6 @@ export interface Agent {
   stopReason: AgentStopReason | null;
   ownerId: string;
   sandboxMode: SandboxMode;
-  networkAccess: boolean;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;

@@ -645,18 +645,6 @@ button {
   color: #666760;
 }
 
-.runtime-policy-warning {
-  display: block;
-  border-radius: 10px;
-  padding: 9px 13px;
-  margin-bottom: 13px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #8a5a12;
-  background: #fdf0da;
-  border: 1px solid #f0dcb0;
-}
-
 .permission-summary {
   display: block;
   border-radius: 10px;

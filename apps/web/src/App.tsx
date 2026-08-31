@@ -170,7 +170,6 @@ export default function App() {
   const [shareRole, setShareRole] = useState<GrantRole>("viewer");
   const [allUsers, setAllUsers] = useState<Array<{ id: string; name: string }>>([]);
   const [policySandboxMode, setPolicySandboxMode] = useState<SandboxMode>("workspace-write");
-  const [policyNetworkAccess, setPolicyNetworkAccess] = useState(true);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const activeRunRef = useRef<AgentRun | null>(null);
@@ -217,7 +216,7 @@ export default function App() {
   );
 
   // Owner/admin only -- mirrors the server's stricter checks on stopAgent,
-  // deleteAgent, and sandbox/network policy. An operator Grant is enough to
+  // deleteAgent, and sandbox policy. An operator Grant is enough to
   // *use* an Agent, not to destroy it, kill its active run, or reconfigure
   // how dangerous it's allowed to be. Without identity, everyone is
   // effectively the sole operator.
@@ -368,7 +367,6 @@ export default function App() {
         tokenBudgetValue: selected.tokenBudget === null ? "" : String(selected.tokenBudget),
       });
       setPolicySandboxMode(selected.sandboxMode);
-      setPolicyNetworkAccess(selected.networkAccess);
     }
   }, [selected]);
 
@@ -453,9 +451,7 @@ export default function App() {
         tokenBudget: resolveTokenBudget(form),
         // Only ever included when the controls are actually shown, so an
         // operator's ordinary edit never trips the owner/admin-only check.
-        ...(canManagePolicy
-          ? { sandboxMode: policySandboxMode, networkAccess: policyNetworkAccess }
-          : {}),
+        ...(canManagePolicy ? { sandboxMode: policySandboxMode } : {}),
       });
       await refreshAgents();
       setShowSettings(false);
@@ -1330,15 +1326,6 @@ export default function App() {
 
                 {canManagePolicy && (
                   <div className="form-grid runtime-policy">
-                    {system?.runtimeProvider !== "container" && (
-                      <div className="runtime-policy-warning">
-                        Network access can't actually be restricted right now: this
-                        Runtime is running Codex as a host process ({system?.runtime
-                          ?? "local-process"}), which has no container boundary to cut
-                        network from. The setting below is saved but has no effect
-                        until this instance runs with RUNTIME_PROVIDER=container.
-                      </div>
-                    )}
                     <label>
                       File access
                       <select
@@ -1349,16 +1336,6 @@ export default function App() {
                       >
                         <option value="read-only">Read only (can view files, can't change them)</option>
                         <option value="workspace-write">Read + write, workspace only (default)</option>
-                      </select>
-                    </label>
-                    <label>
-                      Network access
-                      <select
-                        value={policyNetworkAccess ? "on" : "off"}
-                        onChange={(event) => setPolicyNetworkAccess(event.target.value === "on")}
-                      >
-                        <option value="on">On</option>
-                        <option value="off">Off (blocks installs, API calls, etc.)</option>
                       </select>
                     </label>
                   </div>
@@ -1397,7 +1374,12 @@ export default function App() {
                         Choose a user
                       </option>
                       {users
-                        .filter((user) => user.id !== whoami?.id && !adminUserIds.has(user.id))
+                        .filter(
+                          (user) =>
+                            user.id !== whoami?.id &&
+                            user.id !== selected.ownerId &&
+                            !adminUserIds.has(user.id),
+                        )
                         .map((user) => (
                           <option key={user.id} value={user.id}>
                             {user.name}
