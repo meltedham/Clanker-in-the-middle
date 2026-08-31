@@ -1,4 +1,5 @@
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import { timingSafeEqual } from "node:crypto";
@@ -28,14 +29,42 @@ function safeTokenEquals(candidate: string, expected: string): boolean {
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
 const grantIdParams = z.object({ id: z.string().uuid(), grantId: z.string().uuid() });
-const resourceNameParams = z.object({
-  name: z
-    .string()
-    .trim()
-    .min(1)
-    .max(200)
-    .regex(/^[^/\\]+$/, "Resource names must not contain path separators"),
-});
+
+// Names in this set collide with a Windows reserved device file regardless
+// of extension (e.g. both "NUL" and "NUL.txt" resolve to the NUL device),
+// so a workspace upload or shared resource written under one of these on a
+// Windows host silently targets the device instead of a regular file.
+const RESERVED_WINDOWS_NAMES = new Set([
+  "con", "prn", "aux", "nul",
+  "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+  "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+]);
+const CONTROL_CHAR_PATTERN = String.fromCharCode(0x00) + "-" + String.fromCharCode(0x1f);
+const resourceNameControlChars = new RegExp("[" + CONTROL_CHAR_PATTERN + String.fromCharCode(0x7f) + "]");
+
+function isSafeResourceName(value: string): boolean {
+  // "." and ".." contain no path separator, so the regex below alone lets
+  // them through -- and each is a valid single-segment traversal once
+  // joined onto a resource root (path.join(root, "..") escapes it).
+  if (value === "." || value === "..") return false;
+  if (resourceNameControlChars.test(value)) return false;
+  // Windows silently strips a trailing dot/space when resolving a path, so
+  // "notes.md." and "notes.md " would both actually land on "notes.md" --
+  // ambiguity a strict on-disk resource store shouldn't allow.
+  if (/[.\s]$/.test(value)) return false;
+  const stem = value.split(".")[0]?.toLowerCase() ?? "";
+  if (RESERVED_WINDOWS_NAMES.has(stem)) return false;
+  return true;
+}
+
+const resourceNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .regex(/^[^/\\]+$/, "Resource names must not contain path separators")
+  .refine(isSafeResourceName, "Resource name is invalid or reserved");
+const resourceNameParams = z.object({ name: resourceNameSchema });
 const createUserBody = z.object({
   name: z.string().trim().min(1).max(80),
   // role only has any effect when the caller is already authenticated as an
@@ -70,11 +99,21 @@ const updateAgentBody = createAgentBody.partial().refine(
   (value) => Object.keys(value).length > 0,
   "At least one field is required",
 );
+const NUL_BYTE = String.fromCharCode(0);
 const messageBody = z.object({
-  content: z.string().trim().min(1).max(50_000),
+  // The Codex Runtime passes this straight through as a spawn() argv entry
+  // (see codex-runner.ts buildCodexArgs), and Node refuses to spawn any
+  // process whose args contain a NUL byte -- reject it here with a clean
+  // 400 instead of letting the Run crash with an uncaught ERR_INVALID_ARG_VALUE.
+  content: z
+    .string()
+    .trim()
+    .min(1)
+    .max(50_000)
+    .refine((value) => !value.includes(NUL_BYTE), "Message content must not contain a NUL byte"),
 });
 const uploadBody = z.object({
-  name: z.string().trim().min(1).max(200).regex(/^[^/\\]+$/),
+  name: resourceNameSchema,
   content: z.string().max(2_000_000).optional(),
   contentBase64: z.string().max(4_000_000).optional(),
   mimeType: z.string().max(200).optional(),
@@ -110,6 +149,11 @@ export async function createApp(
         ? ["http://localhost:5173", "http://127.0.0.1:5173"]
         : false,
   });
+
+  // global: false -- this only throttles requests that opt in via a route's
+  // own `config.rateLimit` (currently just POST /api/login below). Every
+  // other route stays unthrottled by this plugin.
+  await app.register(rateLimit, { global: false });
 
   app.addHook("onRequest", async (request, reply) => {
     if (
@@ -190,11 +234,22 @@ export async function createApp(
     return reply.code(201).send(result);
   });
 
-  app.post("/api/login", async (request, reply) => {
-    const body = loginBody.parse(request.body);
-    const result = await service.login(body.name, body.password);
-    return reply.code(200).send(result);
-  });
+  app.post(
+    "/api/login",
+    {
+      config: {
+        rateLimit: {
+          max: config.loginRateLimitMax,
+          timeWindow: config.loginRateLimitWindowMs,
+        },
+      },
+    },
+    async (request, reply) => {
+      const body = loginBody.parse(request.body);
+      const result = await service.login(body.name, body.password);
+      return reply.code(200).send(result);
+    },
+  );
 
   app.get("/api/system", async () => service.systemInfo());
 

@@ -1,5 +1,6 @@
 import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { resolveWithinRoot } from "./safe-path.js";
 
 export interface SharedResourceSummary {
   name: string;
@@ -11,7 +12,7 @@ export class SharedResourceManager {
   constructor(private readonly root: string) {}
 
   resourcePath(name: string): string {
-    return path.join(this.root, name);
+    return resolveWithinRoot(this.root, name);
   }
 
   async initialize(): Promise<void> {

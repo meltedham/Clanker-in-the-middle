@@ -87,6 +87,7 @@ button {
 
 .app-shell {
   height: 100vh;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr);
 }
@@ -1550,17 +1551,7 @@ select:focus {
   .app-shell {
     display: block;
     height: auto;
-  }
-
-  .main {
-    height: auto;
     overflow: visible;
-    display: block;
-  }
-
-  .playground {
-    flex: none;
-    height: 70vh;
   }
 
   .sidebar {
@@ -1599,7 +1590,9 @@ select:focus {
 
   .main {
     padding: 12px;
+    height: auto;
     min-height: calc(100vh - 65px);
+    overflow-y: visible;
   }
 
   .agent-header {

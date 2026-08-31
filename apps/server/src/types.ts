@@ -142,6 +142,17 @@ export interface AgentRun {
   /** The Run that delegated to this one via a `` ```delegate `` block, or null for a directly user-sent Run. */
   parentRunId: string | null;
   /**
+   * The id of the `AuthUser` who originally triggered this delegation tree
+   * (via `sendMessage`), or null under the single-user baseline where no
+   * identity is configured at all. Set once, on the root Run, and never
+   * copied onto its children -- delegation-target visibility is always
+   * resolved by walking `parentRunId` up to the root and reading this,
+   * exactly like `orchestrationIterationCount` above, so a delegated child
+   * Run can only ever reach an Agent the ORIGINAL human actor could already
+   * see, not whatever the delegating Agent's own owner can see.
+   */
+  actorId: string | null;
+  /**
    * Set the moment this Run creates a child Run to delegate to, cleared once
    * that child resolves and this Run's own loop resumes. This is the durable
    * checkpoint that lets boot-time reconciliation tell "a leaf Run with no
