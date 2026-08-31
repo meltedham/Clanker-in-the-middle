@@ -76,6 +76,42 @@ run in this session (no Docker engine was exercised here). If picking this
 back up: that live end-to-end run against a real container engine is the
 next thing worth doing before calling this demo-ready.
 
+**Update (2026-09-01): interrupted Runs that can't be reattached are now
+automatically resumed, not just left `cancelled`.** Previously, when
+`reconcile()` came back with `stillRunning: false` (no live process/container
+to reattach to — the common case for a full restart of the `local-process`
+profile, or any profile once the container itself has also been torn down),
+`AgentService.reconcileRun()` finalized the Run as `cancelled`, preserving
+the checkpointed thread id/partial output so the *next user message* would
+resume the same thread. That still required a human to notice and send a
+follow-up.
+
+Now `reconcileRun()`'s non-reattached branch calls `runOrchestrationLoop()`
+directly — the same "keep going from wherever it left off" engine
+`resumeAfterChild()` already used for resuming a parent once its delegated
+child settles — seeded with whatever `agent.codexThreadId` progress
+checkpoints had already captured. The resume prompt
+(`AgentService.synthesizeResumePrompt()`) resends the original prompt
+verbatim if nothing had streamed back yet (`!run.partial`), or otherwise
+restates the last checkpointed partial output alongside the original task so
+Codex, on the same already-resumed thread, continues rather than repeats
+itself. The existing tree-wide `MAX_ORCHESTRATION_ITERATIONS` cap (already
+used to bound delegation loops) doubles as the ceiling here for free — an
+environment that crashes on every attempt eventually stops retrying instead
+of looping across restarts forever.
+
+**Files changed:** `apps/server/src/agent-service.ts`
+(`synthesizeResumePrompt`, `reconcileRun`); three new/updated cases in
+`agent-service.test.ts`'s "Run interruption and recovery" describe block.
+
+**Still a real limitation:** this resumes the *task*, not necessarily
+mid-sentence — Codex's own thread transcript (persisted under `CODEX_HOME`,
+which is itself a bind-mounted volume in `docker-compose.yml` and therefore
+survives a container recreate) is what makes this possible; if `CODEX_HOME`
+itself isn't persisted in a given deployment, there is no thread to resume
+and this degrades to a fresh retry of the original prompt, same as
+`!run.partial` today.
+
 ## Problem this solves
 
 Today, any interruption between a Run's `queued` state and its natural

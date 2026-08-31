@@ -559,9 +559,21 @@ export class AgentService {
    * live loop iteration uses (`resolveIteration`), so a reattached process
    * that itself wanted to keep delegating resumes correctly instead of
    * having a raw `` ```delegate `` block presented as the final answer.
-   * Otherwise, whatever was already checkpointed via `onProgress` before
-   * the restart (partial output, a discovered thread id) is preserved, not
-   * overwritten with a blank slate.
+   *
+   * If it did NOT survive (process/container gone, or a `local-process`
+   * Run that can never be reattached at all), the task is not simply
+   * declared dead: it's automatically continued via `runOrchestrationLoop`,
+   * exactly the same "keep going from wherever it left off" treatment
+   * `resumeAfterChild` gives a parent once its child settles -- just
+   * triggered here by "the runner came back empty" instead of "the child
+   * finished". Whatever `onProgress` had already checkpointed (partial
+   * output, a discovered thread id) seeds that continuation, so this is a
+   * real resumption of the interrupted Codex session wherever one had
+   * already been opened, not a blind do-over. The tree-wide
+   * `MAX_ORCHESTRATION_ITERATIONS` cap that already guards delegation loops
+   * doubles as the ceiling here too -- a task whose environment keeps
+   * crashing on every attempt eventually stops retrying instead of looping
+   * forever across restarts.
    */
   private async reconcileRun(run: AgentRun): Promise<void> {
     const callbacks = this.progressCallbacks(run.id, run.agentId);
@@ -576,19 +588,14 @@ export class AgentService {
       return;
     }
 
-    const completedAt = now();
-    await this.store.mutate((database) => {
-      const storedRun = database.runs.find((item) => item.id === run.id);
-      if (storedRun) {
-        storedRun.status = "cancelled";
-        storedRun.error = outcome.reason;
-        storedRun.awaitingChildRunId = null;
-        storedRun.completedAt = completedAt;
-        // storedRun.output / agent.codexThreadId are left exactly as the
-        // progress callbacks above (or the interrupted run itself) already
-        // set them -- reconciliation never blanks out a partial result.
-      }
-    });
+    const latest = this.getRun(run.id);
+    const agent = this.getAgent(run.agentId);
+    await this.runOrchestrationLoop(
+      run.agentId,
+      run.id,
+      this.synthesizeResumePrompt(latest),
+      agent.codexThreadId,
+    );
   }
 
   /**
@@ -1308,6 +1315,26 @@ export class AgentService {
       if (storedRoot) storedRoot.orchestrationIterationCount += 1;
     });
     return true;
+  }
+
+  /**
+   * Prompt used to automatically resume a Run whose underlying process/
+   * container did not survive a restart and could not be reattached to
+   * (see `reconcileRun`). If nothing had streamed back yet (`!run.partial`),
+   * Codex never actually saw the prompt, so it's simply resent unchanged.
+   * Otherwise the last checkpointed partial output is included so Codex --
+   * on the same, already-resumed thread -- knows what it had already
+   * produced before being interrupted, instead of blindly repeating itself.
+   */
+  private synthesizeResumePrompt(run: AgentRun): string {
+    if (!run.partial) return run.prompt;
+    return (
+      "[Automatically resumed after a service restart]\n" +
+      "You were interrupted before finishing this task. Here is the last partial progress you had reported:\n" +
+      (run.output ?? "(no partial output was captured)") +
+      "\n\nPlease continue and complete the original task:\n" +
+      run.prompt
+    );
   }
 
   private synthesizeFailurePrompt(reason: string): string {
