@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
 import { isRetryableApiError, withRetry } from "./reconnect";
 import type { AuthUser, Grant, GrantRole } from "./api";
@@ -68,6 +68,11 @@ function formatTime(value: string): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function truncate(value: string, maxLength: number): string {
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  return oneLine.length > maxLength ? oneLine.slice(0, maxLength) + "…" : oneLine;
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -187,6 +192,13 @@ export default function App() {
     () => runs.reduce((total, run) => total + countRunTokens(run.usage), 0),
     [runs],
   );
+
+  const runsById = useMemo(() => {
+    const map = new Map<string, AgentRun>();
+    for (const run of runs) map.set(run.id, run);
+    if (activeRun) map.set(activeRun.id, activeRun);
+    return map;
+  }, [runs, activeRun]);
 
   const tokenBudgetRemaining = useMemo(() => {
     if (!selected || selected.tokenBudget === null) return null;
@@ -683,11 +695,15 @@ export default function App() {
       return;
     }
     setShowTrace(true);
-    if (!activeRun) return;
+    const targetRuns = runs.length > 0 ? runs : activeRun ? [activeRun] : [];
+    if (targetRuns.length === 0) return;
     setTraceLoading(true);
     try {
-      const result = await api.trace(activeRun.id);
-      setTraceEvents(result.events);
+      const results = await Promise.all(targetRuns.map((run) => api.trace(run.id)));
+      const merged = results
+        .flatMap((result) => result.events)
+        .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.seq - b.seq);
+      setTraceEvents(merged);
     } catch (reason) {
       reportError(reason);
     } finally {
@@ -1607,45 +1623,58 @@ export default function App() {
             </section>
 
             <section className="playground">
-              <div className="playground-topbar">
-                <div>
-                  <span className="eyebrow">Playground</span>
-                  <h2>Build something with your Agent</h2>
+              <div className="playground-header">
+                <div className="playground-topbar">
+                  <div>
+                    <span className="eyebrow">Playground</span>
+                    <h2>Build something with your Agent</h2>
+                  </div>
+                  <div className="playground-status">
+                    <div className="session-info">
+                      <span className="pulse" />
+                      {selected.codexThreadId ? "Session connected" : "New session"}
+                      {(activeRun || runs.length > 0) && (
+                        <button type="button" className="button button-ghost" onClick={toggleTrace}>
+                          {showTrace ? "Hide trace" : "View trace"}
+                        </button>
+                      )}
+                    </div>
+                    {activeRun?.retrieval && <RetrievalBadge retrieval={activeRun.retrieval} />}
+                  </div>
                 </div>
-                <div className="playground-status">
-                  <div className="session-info">
-                    <span className="pulse" />
-                    {selected.codexThreadId ? "Session connected" : "New session"}
-                    {activeRun && (
-                      <button type="button" className="button button-ghost" onClick={toggleTrace}>
-                        {showTrace ? "Hide trace" : "View trace"}
-                      </button>
+
+                {showTrace && (activeRun || runs.length > 0) && (
+                  <div className="trace-panel" aria-live="polite">
+                    {traceLoading ? (
+                      <Spinner />
+                    ) : traceEvents && traceEvents.length > 0 ? (
+                      <ul className="trace-list">
+                        {traceEvents.map((event, index) => {
+                          const previous = traceEvents[index - 1];
+                          const run = runsById.get(event.runId);
+                          return (
+                            <Fragment key={event.runId + ":" + event.seq}>
+                              {(!previous || previous.runId !== event.runId) && (
+                                <li className="trace-run-divider">
+                                  {run ? truncate(run.prompt, 90) : "Run " + event.runId}
+                                </li>
+                              )}
+                              <li className={"trace-event trace-" + event.type}>
+                                <span className="trace-seq">{event.seq}</span>
+                                <span className="trace-time">{formatTime(event.occurredAt)}</span>
+                                <span className="trace-type">{event.type}</span>
+                                <span className="trace-summary">{event.summary}</span>
+                              </li>
+                            </Fragment>
+                          );
+                        })}
+                      </ul>
+                    ) : (
+                      <p className="trace-empty">No trace events recorded yet.</p>
                     )}
                   </div>
-                  {activeRun?.retrieval && <RetrievalBadge retrieval={activeRun.retrieval} />}
-                </div>
+                )}
               </div>
-
-              {showTrace && activeRun && (
-                <div className="trace-panel" aria-live="polite">
-                  {traceLoading ? (
-                    <Spinner />
-                  ) : traceEvents && traceEvents.length > 0 ? (
-                    <ul className="trace-list">
-                      {traceEvents.map((event) => (
-                        <li key={event.seq} className={"trace-event trace-" + event.type}>
-                          <span className="trace-seq">{event.seq}</span>
-                          <span className="trace-time">{formatTime(event.occurredAt)}</span>
-                          <span className="trace-type">{event.type}</span>
-                          <span className="trace-summary">{event.summary}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="trace-empty">No trace events recorded for this Run yet.</p>
-                  )}
-                </div>
-              )}
 
               <div className="messages">
                 {messages.length === 0 && !activeRun ? (
