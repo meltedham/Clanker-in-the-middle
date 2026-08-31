@@ -39,7 +39,10 @@ afterEach(async () => {
   );
 });
 
-async function makeService(runner: AgentRunner = new FakeRunner()): Promise<AgentService> {
+async function makeService(
+  runner: AgentRunner = new FakeRunner(),
+  envOverrides: Record<string, string> = {},
+): Promise<AgentService> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-rag-test-"));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -49,6 +52,7 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
     CODEX_HOME: path.join(root, "codex"),
     OPENROUTER_API_KEY: "test-key",
     OPENROUTER_MODEL: "test-model",
+    ...envOverrides,
   });
   const service = new AgentService(
     config,
@@ -196,7 +200,6 @@ describe("RAG retrieval", () => {
         workspacePath: path.join(root, "empty"),
       } as never,
       "search for something",
-      null,
     );
 
     expect(context.summary).toMatchObject({
@@ -226,5 +229,53 @@ describe("RAG retrieval", () => {
 
     const prompt = runner.prompts.at(-1) ?? "";
     expect(prompt).not.toContain("chair, vice chair, and secretary");
+  });
+
+  it("rejects an upload too large to ever be RAG-indexed instead of silently accepting it", async () => {
+    const service = await makeService(new FakeRunner(), { RAG_MAX_FILE_BYTES: "100" });
+    const agent = await service.createAgent({ name: "Size Check" });
+
+    await expect(
+      service.uploadAgentResource(agent.id, {
+        name: "too-big.md",
+        content: "x".repeat(200),
+      }),
+    ).rejects.toThrow(/exceeds the maximum size/);
+  });
+
+  it("rejects an upload that doesn't look like plain text", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Binary Check" });
+    const nulByte = String.fromCharCode(0);
+
+    await expect(
+      service.uploadAgentResource(agent.id, {
+        name: "not-text.md",
+        content: "looks fine" + nulByte + "but isn't",
+      }),
+    ).rejects.toThrow(/doesn't look like plain text/);
+  });
+
+  it("prioritizes the most recently modified files once the scan limit truncates", async () => {
+    const runner = new FakeRunner();
+    const service = await makeService(runner, { RAG_SCAN_LIMIT: "1" });
+    const agent = await service.createAgent({ name: "Recency Check" });
+
+    await service.uploadAgentResource(agent.id, {
+      name: "older.md",
+      content: "Older clue: the launch code is ALPHA.",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await service.uploadAgentResource(agent.id, {
+      name: "newer.md",
+      content: "Newer clue: the launch code is OMEGA.",
+    });
+
+    const { run } = await service.sendMessage(agent.id, "what is the launch code?");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const prompt = runner.prompts.at(-1) ?? "";
+    expect(prompt).toContain("Newer clue");
+    expect(prompt).not.toContain("Older clue");
   });
 });

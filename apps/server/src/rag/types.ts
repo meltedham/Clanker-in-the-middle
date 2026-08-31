@@ -8,7 +8,7 @@ export interface RagSummary {
   matchCount: number;
 }
 
-export type RagSourceType = "workspace" | "shared" | "message";
+export type RagSourceType = "workspace" | "shared";
 
 export interface RagMatch {
   sourceType: RagSourceType;

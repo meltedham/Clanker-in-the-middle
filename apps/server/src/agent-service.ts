@@ -783,7 +783,39 @@ export class AgentService {
     input: UploadInput,
   ): Promise<{ name: string; size: number; updatedAt: string }> {
     const content = (await normalizeUploadContent(input)).trim();
+    this.assertIndexableContent(content, "Shared resource");
     return this.sharedResources.write(input.name, content);
+  }
+
+  /**
+   * Both upload endpoints exist specifically to feed the RAG corpus (see
+   * the UI copy: "add it to this Agent's RAG corpus" / "Available to all
+   * authorized agents via RAG") -- a file too large or too obviously
+   * non-text to ever actually be scanned by RagService.collectFilesystemChunks
+   * would otherwise be accepted, sit on disk, and silently never do the one
+   * thing it was uploaded for. Rejecting it here, loudly, at upload time is
+   * the honest behavior; the size threshold is the exact same
+   * config.ragMaxFileBytes RagService itself skips past when scanning, so
+   * this can never reject something RAG would have picked up anyway (or
+   * vice versa).
+   */
+  private assertIndexableContent(content: string, label: string): void {
+    if (Buffer.byteLength(content, "utf8") > this.config.ragMaxFileBytes) {
+      throw new HttpError(
+        400,
+        label +
+          " exceeds the maximum size that can be indexed for retrieval (" +
+          this.config.ragMaxFileBytes +
+          " bytes). Reduce the file size and try again.",
+      );
+    }
+    if (content.includes(String.fromCharCode(0))) {
+      throw new HttpError(
+        400,
+        label +
+          " doesn't look like plain text (contains a NUL byte) -- only text/Markdown and PDF uploads are supported.",
+      );
+    }
   }
 
   async deleteSharedResource(name: string): Promise<void> {
@@ -805,6 +837,7 @@ export class AgentService {
   ): Promise<{ name: string; size: number; updatedAt: string }> {
     this.getAgent(agentId, actor, "write");
     const content = (await normalizeUploadContent(input)).trim();
+    this.assertIndexableContent(content, "Upload");
     return this.workspaces.writeUpload(agentId, input.name, content);
   }
 
@@ -1119,7 +1152,7 @@ export class AgentService {
 
     let ragContext: RagContext;
     try {
-      ragContext = await this.ragService.buildContext(result.agentAtStart, normalizedPrompt, runId);
+      ragContext = await this.ragService.buildContext(result.agentAtStart, normalizedPrompt);
     } catch {
       ragContext = {
         prompt: normalizedPrompt,

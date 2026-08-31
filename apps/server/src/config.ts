@@ -65,6 +65,16 @@ const envSchema = z.object({
   // endpoint with no other guard against credential-stuffing/brute-force.
   LOGIN_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
   LOGIN_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  // A file larger than this is skipped by RAG scanning entirely (never
+  // chunked/embedded/retrievable) -- also enforced at upload time, so an
+  // upload too big to ever be indexed is rejected loudly instead of
+  // silently accepted and then silently never surfaced.
+  RAG_MAX_FILE_BYTES: z.coerce.number().int().positive().default(256_000),
+  // Hard cap on how many chunks one RAG scan collects across a workspace +
+  // the shared resource root. Chunks are prioritized by file mtime
+  // (newest first) before this cap is applied, so it's "the N most
+  // recently touched chunks", not an arbitrary filesystem-order cutoff.
+  RAG_SCAN_LIMIT: z.coerce.number().int().positive().default(200),
   OPENROUTER_BASE_URL: z
     .string()
     .url()
@@ -158,7 +168,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     nodeEnv: env.NODE_ENV,
     ragTopK: 8,
     ragChunkSize: 1_200,
-    ragScanLimit: 200,
+    ragScanLimit: env.RAG_SCAN_LIMIT,
+    ragMaxFileBytes: env.RAG_MAX_FILE_BYTES,
     ragMaxContextChars: 12_000,
     ragMinScore: 0.22,
     ragStrongScore: 0.42,
