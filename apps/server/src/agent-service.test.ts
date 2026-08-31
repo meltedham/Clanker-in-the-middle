@@ -377,7 +377,6 @@ describe("Run interruption and recovery", () => {
       status: "busy",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("agent-restart"),
       codexThreadId: null,
       lastError: null,
@@ -460,7 +459,6 @@ describe("Run interruption and recovery", () => {
       status: "busy",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("agent-gone"),
       codexThreadId: "thread-before-crash",
       lastError: null,
@@ -929,7 +927,6 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       status: "busy",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("orchestrator"),
       codexThreadId: null,
       lastError: null,
@@ -944,7 +941,6 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       status: "ready",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("helper"),
       codexThreadId: null,
       lastError: null,
@@ -1036,7 +1032,6 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       status: "busy",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("parent-agent"),
       codexThreadId: "parent-thread",
       lastError: null,
@@ -1051,7 +1046,6 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
       status: "ready",
       ownerId: "unclaimed",
       sandboxMode: "workspace-write",
-      networkAccess: true,
       workspacePath: workspaces.workspacePath("child-agent"),
       codexThreadId: "child-thread",
       lastError: null,
@@ -1156,10 +1150,6 @@ describe("Multi-agent delegation and reconciliation across a restart", () => {
 });
 
 describe("systemInfo reports the true enforcement boundary", () => {
-  // The web UI's "networkAccess is a no-op here" warning (App.tsx) trusts
-  // this field completely -- if it ever misreported "container" while
-  // actually running as a host process, that warning would silently stop
-  // showing up exactly when it matters most.
   it("reports runtimeProvider matching the actual configured value, not a hardcoded default", async () => {
     for (const runtimeProvider of ["local-process", "container"] as const) {
       const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
@@ -1192,14 +1182,14 @@ describe("systemInfo reports the true enforcement boundary", () => {
 });
 
 describe("Runtime policy back-compat", () => {
-  it("backfills sandboxMode/networkAccess for Agents stored before those fields existed", async () => {
+  it("backfills sandboxMode for Agents stored before the field existed", async () => {
     const { mkdir, writeFile } = await import("node:fs/promises");
     const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
     temporaryDirectories.push(root);
     const dataDir = path.join(root, "data");
     await mkdir(dataDir, { recursive: true });
-    // Simulates a database.json written before sandboxMode/networkAccess
-    // existed: the stored Agent simply has neither key.
+    // Simulates a database.json written before sandboxMode existed: the
+    // stored Agent simply has no such key.
     await writeFile(
       path.join(dataDir, "db.json"),
       JSON.stringify({
@@ -1248,7 +1238,6 @@ describe("Runtime policy back-compat", () => {
     // Backfilled to the platform's configured default at the time, not a
     // hardcoded string -- proving it reads real config, not a guess.
     expect(agent.sandboxMode).toBe("read-only");
-    expect(agent.networkAccess).toBe(true);
   });
 });
 

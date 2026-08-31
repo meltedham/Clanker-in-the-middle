@@ -6,8 +6,8 @@ Identity and access-control layer added on top of the Agent Launchpad starter ki
 
 The starter kit's only guard is one shared bearer token — anyone holding it can
 read, edit, run, or delete every Agent. No accounts, no ownership, no way to share
-one Agent without handing over full control, no limit on what a running Agent can
-actually touch (files, network).
+one Agent without handing over full control, no limit on what files a running
+Agent can actually touch.
 
 ## 2. Where enforcement lives
 
@@ -29,7 +29,7 @@ through.
 ```
 User    { id, name, tokenHash, passwordHash?, role: "admin"|"member", createdAt }
 Grant   { id, agentId, userId, role: "viewer"|"operator", createdAt, revokedAt }
-Agent  += { ownerId, sandboxMode: "read-only"|"workspace-write", networkAccess: boolean }
+Agent  += { ownerId, sandboxMode: "read-only"|"workspace-write" }
 ```
 
 - `tokenHash` — SHA-256 (tokens are already high-entropy).
@@ -37,8 +37,8 @@ Agent  += { ownerId, sandboxMode: "read-only"|"workspace-write", networkAccess: 
   Optional; only accounts with one can use `/api/login`.
 - `Grant` is re-checked on every request — revoking takes effect immediately, nothing
   is cached.
-- `sandboxMode` / `networkAccess` are per-Agent, not platform-wide (§5). Old records
-  without these fields are backfilled to the platform default on load.
+- `sandboxMode` is per-Agent, not platform-wide (§5). Old records without this field
+  are backfilled to the platform default on load.
 - Every actor parameter defaults to `null`, preserving single-user behavior for
   anyone who never creates a user.
 
@@ -68,7 +68,7 @@ Agent  += { ownerId, sandboxMode: "read-only"|"workspace-write", networkAccess: 
 | Start | ✅ | ✅ | ✅ | ❌ 403 | ❌ 403 |
 | **Stop** | ✅ | ✅ | ❌ 403 | ❌ 403 | ❌ 403 |
 | **Delete** | ✅ | ✅ | ❌ 403 | ❌ 403 | ❌ 403 |
-| **Change sandbox/network policy** | ✅ | ✅ | ❌ 403 | ❌ 403 | ❌ 403 |
+| **Change sandbox policy** | ✅ | ✅ | ❌ 403 | ❌ 403 | ❌ 403 |
 | Grant / revoke / list grants | ✅ | ✅ | ❌ 403 | ❌ 403 | ❌ 403 |
 
 Bolded rows are stricter than plain write: an operator Grant lets you *use* an
@@ -86,9 +86,9 @@ or an admin can stop it"), never a generic "forbidden."
 
 ## 5. Per-Agent runtime policy
 
-Two axes, chosen because each has a real, OS-enforced mechanism underneath — Codex
-has no way to distinguish "an install command" from any other shell command, so a
-fake per-command allow/deny list wouldn't be a real control.
+`sandboxMode`, chosen because it has a real, OS-enforced mechanism underneath —
+Codex has no way to distinguish "an install command" from any other shell
+command, so a fake per-command allow/deny list wouldn't be a real control.
 
 - **`sandboxMode`** (UI label: "File access") — `read-only` or `workspace-write`,
   passed straight to Codex CLI's own `--sandbox` flag. Per-Agent now, previously
@@ -98,12 +98,8 @@ fake per-command allow/deny list wouldn't be a real control.
     config either. Startup now refuses to run rather than silently falling back to
     it when Codex's Landlock sandbox is unavailable on the host kernel
     (`start-local-poc.sh`, `deploy-existing-ecs.sh`).
-- **`networkAccess`** — boolean, flips the disposable container's `--network`
-  between `bridge` and `none`. Cuts the network entirely instead of trying to
-  detect "is this install traffic." Only enforceable by `RUNTIME_PROVIDER=container`;
-  documented as a no-op for `local-process` (no container boundary to restrict).
 
-Changing either requires owner/admin, stricter than the "write" needed to edit an
+Changing it requires owner/admin, stricter than the "write" needed to edit an
 Agent's name or instructions.
 
 ## 6. Web UI
@@ -115,11 +111,9 @@ Agent's name or instructions.
 - **Share panel** — grant/revoke `viewer`/`operator` for an existing user; admins
   excluded from the grantee dropdown. Active Grants always lists every admin too,
   labeled **"Admin · full access"** with an **"Unrevokable"** tag instead of Revoke.
-- **Settings panel** — File access/network dropdowns shown only to owner/admin.
-  Shared Agents show a banner with your actual permission; a `viewer` sees disabled
-  fields and no Save button. When `system.runtimeProvider !== "container"`, an
-  inline warning explains that Network access is saved but has no real effect in
-  that mode — a control that quietly did nothing was worse than no control at all.
+- **Settings panel** — File access dropdown shown only to owner/admin. Shared
+  Agents show a banner with your actual permission; a `viewer` sees disabled
+  fields and no Save button.
 - **Permission-denied notifications** — a `403` gets a distinct amber banner
   ("Permission denied: …"), auto-dismisses after 6 seconds like a toast.
 - **Stop/Delete/Share/policy buttons** are hidden client-side for anyone who can't
@@ -137,7 +131,7 @@ Agent's name or instructions.
 | `GET /api/agents/:id/grants` | owner/admin | Real Grants + synthetic non-revocable admin entries. |
 | `DELETE /api/agents/:id/grants/:grantId` | owner/admin | Immediate. |
 | `GET /api/agents` | any | Each Agent includes `myRole` for the caller. |
-| `POST` / `PATCH /api/agents` | varies | `PATCH` accepts `sandboxMode`/`networkAccess`, owner/admin-only. |
+| `POST` / `PATCH /api/agents` | varies | `PATCH` accepts `sandboxMode`, owner/admin-only. |
 
 `GET /api/auth` also gained `identityEnabled`, so the frontend knows when the
 shared token has permanently stopped working.
@@ -151,17 +145,16 @@ logic:
   activates the moment the first account exists.
 - `grants.test.ts` (17) — admin bootstrap/bypass, viewer vs. operator, live
   revocation, upsert-not-duplicate, owner-only grant management, admins can't be
-  granted a role, operator can start but not stop/delete or change sandbox/network
+  granted a role, operator can start but not stop/delete or change sandbox
   policy, an invalid or removed (`danger-full-access`) `sandboxMode` is rejected
   with `400` before reaching `AgentService`, `myRole` correctness.
 - `password-login.test.ts` (5) — signup+login round trip, wrong password/unknown
   name → identical `401`, re-login rotates the token, duplicate names rejected.
-- `agent-service.test.ts` — sandbox/network backfill reads the real configured
-  default, not a hardcoded string; `systemInfo().runtimeProvider` reports the true
-  configured value (the source of truth the Settings-panel no-op warning, §6,
-  trusts completely).
-- `container-codex-runner.test.ts` — `--network`/`--sandbox` actually change based
-  on the Agent's own policy.
+- `agent-service.test.ts` — sandbox backfill reads the real configured default,
+  not a hardcoded string; `systemInfo().runtimeProvider` reports the true
+  configured value.
+- `container-codex-runner.test.ts` — `--sandbox` actually changes based on the
+  Agent's own policy.
 - `sandbox-enforcement.test.ts` — real Docker + Codex's own Landlock, no model call
   involved: a write is genuinely blocked without a write grant, genuinely allowed
   inside the workspace with one, and still refused outside the workspace even then.
@@ -173,10 +166,6 @@ Run everything: `npm run check`.
 
 ## 9. Known limitations
 
-- **`local-process` can't enforce `networkAccess`** — no container boundary to cut
-  network from; only `RUNTIME_PROVIDER=container` enforces it. The Settings panel
-  now warns inline when this is the case (§6), instead of showing a control that
-  silently does nothing.
 - **No message-level Grant scoping** — a viewer/operator sees an Agent's entire
   conversation history, not a per-grantee slice.
 - **New routes don't auto-inherit protection** — a teammate's new endpoint starts
@@ -188,11 +177,6 @@ Run everything: `npm run check`.
   other started.
 - **Requires Landlock on the host kernel** for `workspace-write` to mean anything —
   without it, startup refuses to run rather than downgrading to unrestricted access.
-- **`networkAccess: false` disables the Agent, not just its side effects.** The same
-  disposable container that runs Codex's shell commands is also what calls the Ark
-  model API (`ARK_API_KEY` is injected into it directly, not proxied through the
-  server) — cutting its network stops the model call too, so every Run fails outright
-  rather than running network-free.
 
 ## 10. Trying it
 

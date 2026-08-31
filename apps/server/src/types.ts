@@ -20,12 +20,7 @@ export const UNCLAIMED_OWNER_ID = "unclaimed";
  * just an instruction); "workspace-write" allows writes within the
  * workspace (the platform default). No unrestricted option: Codex's own
  * `danger-full-access` mode is deliberately not exposed anywhere in this
- * type, the per-Agent schema, or the platform env config.
- * `networkAccess: false` runs the per-turn container with no network at
- * all, so anything requiring the internet (installing a dependency,
- * reaching an API) fails on its own -- neither of these is a per-command
- * allow/deny list; they're the two real, OS-enforced levers the Runtime
- * actually has. */
+ * type, the per-Agent schema, or the platform env config. */
 export type SandboxMode = "read-only" | "workspace-write";
 
 export type UserRole = "admin" | "member";
@@ -101,7 +96,6 @@ export interface Agent {
   stopReason: AgentStopReason | null;
   ownerId: string;
   sandboxMode: SandboxMode;
-  networkAccess: boolean;
   workspacePath: string;
   codexThreadId: string | null;
   lastError: string | null;
@@ -187,7 +181,6 @@ export interface CreateAgentInput {
   description?: string | undefined;
   instructions?: string | undefined;
   sandboxMode?: SandboxMode | undefined;
-  networkAccess?: boolean | undefined;
   tokenBudget?: number | null | undefined;
 }
 
@@ -196,7 +189,6 @@ export interface UpdateAgentInput {
   description?: string | undefined;
   instructions?: string | undefined;
   sandboxMode?: SandboxMode | undefined;
-  networkAccess?: boolean | undefined;
   tokenBudget?: number | null | undefined;
 }
 
@@ -221,7 +213,6 @@ export interface RunnerRequest {
   prompt: string;
   threadId: string | null;
   sandboxMode: SandboxMode;
-  networkAccess: boolean;
 }
 
 /** Incremental progress reported while a Run is still executing. */

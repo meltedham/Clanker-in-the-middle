@@ -59,6 +59,18 @@ export function buildCodexArgs(
     "--json",
     "--sandbox",
     sandboxMode,
+    // `codex exec` has no standalone `-a`/`--ask-for-approval` flag (that's
+    // only on the top-level interactive `codex` command); this config
+    // override is the documented way to set it here. Without it, Codex
+    // defaults to "on-request": the model itself decides when to ask for
+    // approval to escalate past a sandbox denial. In this headless `exec`
+    // context there's no human to actually approve that request, so it gets
+    // waved through anyway -- silently defeating sandboxMode the moment the
+    // model chooses to ask. "never" makes a sandbox denial final: the
+    // failure is reported straight back to the model instead of being
+    // escalatable.
+    "-c",
+    "approval_policy=never",
     "--skip-git-repo-check",
     "-C",
     workspacePath,
@@ -116,11 +128,9 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
   }
 }
 
-/** Runs Codex as a host process (RUNTIME_PROVIDER=local-process). Note:
- * there is no container boundary here, so `request.networkAccess` cannot be
- * enforced by this Runtime -- only ContainerCodexRunner can actually cut
- * network access. sandboxMode is still enforced, since that's Codex's own
- * flag, independent of the process/container boundary. */
+/** Runs Codex as a host process (RUNTIME_PROVIDER=local-process). sandboxMode
+ * is enforced, since that's Codex's own flag, independent of the
+ * process/container boundary. */
 export class CodexRunner implements AgentRunner {
   private readonly active = new Map<
     string,

@@ -92,7 +92,6 @@ const createAgentBody = z.object({
   // Runtime policy. AgentService restricts changing these to the Agent's
   // owner or an admin, even though ordinary fields above only need "write".
   sandboxMode: z.enum(["read-only", "workspace-write"]).optional(),
-  networkAccess: z.boolean().optional(),
   tokenBudget: tokenBudgetField,
 });
 const updateAgentBody = createAgentBody.partial().refine(
